@@ -8,10 +8,11 @@ from typing import List, Tuple, Literal
 import os
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.ecg_qa.ecgqa_cot_loader import load_ecg_qa_cot_splits
 import numpy as np
 
-class ECGQACoTQADataset(QADataset):
+class ECGQACoTQADataset(NoiseInjectionMixin, QADataset):
     """
     ECG-QA Chain-of-Thought Dataset for question answering with electrocardiogram data.
 
@@ -20,11 +21,6 @@ class ECGQACoTQADataset(QADataset):
 
     Requires: pip install wfdb
     """
-
-    # Class-level noise configuration (shared across all instances for interpretability testing)
-    _use_noise = False
-    _noise_type = "gaussian"  # Options: "gaussian", "shuffle", "zero", "uniform"
-    _noise_seed = None  # For reproducibility
 
     def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str,
                  format_sample_str: bool = False, time_series_format_function=None,
@@ -51,76 +47,6 @@ class ECGQACoTQADataset(QADataset):
         # (parent class sets self.split after calling _load_splits)
         self.split = split
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
-
-    @classmethod
-    def set_noise_mode(cls, use_noise: bool, noise_type: str = "gaussian", noise_seed: int = None):
-        """
-        Set noise mode for all dataset instances (for interpretability testing).
-
-        This replaces real ECG signals with noise to test if the model actually
-        uses the signal content or relies on other features (text prompts, metadata).
-
-        Args:
-            use_noise: If True, replace real ECG signals with noise
-            noise_type: Type of noise ("gaussian", "shuffle", "zero", "uniform")
-            noise_seed: Random seed for reproducibility (set ONCE here, not per-signal)
-        """
-        # Clear all caches to ensure noise mode is applied fresh
-        # This is critical because the parent class caches formatted samples at the class level
-        cls.clear_caches()
-
-        cls._use_noise = use_noise
-        cls._noise_type = noise_type
-        cls._noise_seed = noise_seed
-        # Set seed ONCE here, so subsequent calls generate different sequences
-        if noise_seed is not None:
-            np.random.seed(noise_seed)
-        if use_noise:
-            print(f"[NOISE MODE] ECG signals will be replaced with '{noise_type}' noise (seed={noise_seed})")
-
-    @classmethod
-    def get_noise_mode(cls) -> dict:
-        """Get current noise configuration."""
-        return {
-            "use_noise": cls._use_noise,
-            "noise_type": cls._noise_type,
-            "noise_seed": cls._noise_seed
-        }
-
-    @classmethod
-    def _generate_noise_signal(cls, length: int, noise_type: str, original_signal: np.ndarray = None) -> np.ndarray:
-        """
-        Generate a noise signal of the specified type.
-
-        Args:
-            length: Length of the signal to generate
-            noise_type: Type of noise ("gaussian", "shuffle", "zero", "uniform")
-            original_signal: Original signal (required for "shuffle" noise type)
-
-        Returns:
-            Noise signal as numpy array
-
-        Note: The random seed is set ONCE in set_noise_mode(), not here.
-              This ensures each signal gets unique noise while still being reproducible.
-        """
-        if noise_type == "gaussian":
-            # Standard Gaussian noise (mean=0, std=1)
-            return np.random.randn(length)
-        elif noise_type == "shuffle":
-            # Shuffle the original signal (destroys temporal structure but preserves amplitude distribution)
-            if original_signal is None:
-                return np.random.randn(length)
-            shuffled = original_signal.copy()
-            np.random.shuffle(shuffled)
-            return shuffled
-        elif noise_type == "zero":
-            # All zeros (no signal)
-            return np.zeros(length)
-        elif noise_type == "uniform":
-            # Uniform random noise in [-1, 1]
-            return np.random.uniform(-1, 1, length)
-        else:
-            raise ValueError(f"Unknown noise type: {noise_type}. Options: gaussian, shuffle, zero, uniform")
 
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
         """Load the ECG-QA CoT dataset splits."""
@@ -592,8 +518,11 @@ Make sure that your last word is the answer. You MUST end your response with "An
                 ecg_label = f"This is ECG Lead {lead_name}"
                 if len(ecg_paths) > 1:
                     ecg_label += f" (Recording {i+1})"
-                    
-                ecg_label += f", it has mean {mean_val:.4f} and std {std_val:.4f}:"
+
+                if self.__class__._use_noise and self.__class__._strip_stats:
+                    ecg_label += ":"
+                else:
+                    ecg_label += f", it has mean {mean_val:.4f} and std {std_val:.4f}:"
                 
                 try:
                     ecg_prompts.append(

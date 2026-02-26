@@ -577,12 +577,21 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
     def load_from_file(self, path: str = "best_model.pt"):
         """
         Load model parameters with non-strict loading to handle Flamingo-specific layers.
+
+        Handles two checkpoint formats:
+        - "llm" key: from store_to_file(), keys are self.llm.state_dict() (no "model." prefix)
+        - "model_state" key: from curriculum_learning._save_checkpoint(), keys are
+          OpenTSLMFlamingo.state_dict() (has "model." prefix since self.model is a submodule)
         """
         checkpoint = torch.load(path, map_location=self.device)
 
         if "llm" in checkpoint:
-            model_state = checkpoint["llm"]
+            # Keys from self.llm.state_dict(): vision_encoder.xxx, lang_encoder.xxx
+            # Need to add "model." prefix to match OpenTSLMFlamingo's submodule structure
+            model_state = {f"model.{k}": v for k, v in checkpoint["llm"].items()}
         elif "model_state" in checkpoint:
+            # Keys from OpenTSLMFlamingo.state_dict(): model.vision_encoder.xxx, etc.
+            # Already has correct "model." prefix
             model_state = checkpoint["model_state"]
         else:
             raise RuntimeError("No recognized model state key in checkpoint.")
@@ -590,12 +599,6 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         # Handle DDP (DistributedDataParallel) if needed
         if hasattr(self, "module"):
             model_state = {f"module.{k}": v for k, v in model_state.items()}
-
-        # Remove 'model.' prefix if present in checkpoint keys
-        if all(k.startswith("model.") for k in model_state.keys()):
-            model_state = {
-                k.replace("model.", "", 1): v for k, v in model_state.items()
-            }
 
         # Load state dict with strict=False to handle missing/unexpected keys
         missing_keys, unexpected_keys = self.load_state_dict(model_state, strict=False)

@@ -8,10 +8,19 @@ from typing import List, Tuple, Literal
 import os
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.sleep.sleepedf_cot_loader import load_sleepedf_cot_splits
 import numpy as np
 
-class SleepEDFCoTQADataset(QADataset):
+class SleepEDFCoTQADataset(NoiseInjectionMixin, QADataset):
+    @classmethod
+    def clear_caches(cls):
+        """Clear cached data to force re-formatting when switching noise modes."""
+        for attr in ('loaded', '_train_dataset', '_validation_dataset', '_test_dataset'):
+            if hasattr(cls, attr):
+                delattr(cls, attr)
+        print(f"Cleared all {cls.__name__} dataset caches")
+
     def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str, format_sample_str: bool = False, time_series_format_function=None):
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
 
@@ -47,11 +56,25 @@ class SleepEDFCoTQADataset(QADataset):
         mean = float(np.mean(series))
         std = float(np.std(series))
         min_std = 1e-6
-        std = max(std, min_std)
-        series_norm = (series - mean) / std
-        text_prompt = f"The following is the EEG time series, it has mean {mean:.4f} and std {std:.4f}:"
-        
-        return [TextTimeSeriesPrompt(text_prompt, series_norm.tolist())]
+        std_safe = max(std, min_std)
+        series_norm = (series - mean) / std_safe
+
+        # NOISE INJECTION: replace normalized EEG with noise if enabled
+        if self.__class__._use_noise:
+            noise = self.__class__._generate_noise_signal(
+                length=len(series_norm),
+                noise_type=self.__class__._noise_type,
+                original_signal=series_norm,
+            )
+            series_data = noise.tolist()
+        else:
+            series_data = series_norm.tolist()
+
+        if self.__class__._use_noise and self.__class__._strip_stats:
+            text_prompt = "The following is the EEG time series:"
+        else:
+            text_prompt = f"The following is the EEG time series, it has mean {mean:.4f} and std {std:.4f}:"
+        return [TextTimeSeriesPrompt(text_prompt, series_data)]
 
     @staticmethod
     def get_labels() -> List[str]:

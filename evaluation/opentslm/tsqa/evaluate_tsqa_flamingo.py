@@ -6,18 +6,18 @@
 # SPDX-License-Identifier: MIT
 
 """
-Evaluate OpenTSLMFlamingo on ECG-QA CoT dataset with signal contribution tracking.
+Evaluate OpenTSLMFlamingo on TSQA dataset with signal contribution tracking.
 
-This script runs inference on the ECG-QA test set and measures:
-1. Accuracy/F1 metrics
+This script runs inference on the TSQA test set and measures:
+1. MCQ accuracy metrics
 2. Signal contribution metrics (residual_stream, gated_cross_attn_output, signal_contribution_pct)
 
 Usage:
-    python evaluate_ecg_flamingo.py --checkpoint path/to/best_model.pt [--max_samples 100] [--use_noise]
+    python evaluate_tsqa_flamingo.py --checkpoint path/to/best_model.pt [--max_samples 100] [--use_noise]
 
 Output:
-    - Accuracy and F1 metrics per template
-    - Signal contribution summary showing how much the ECG signal influences model output
+    - Accuracy metrics per task type
+    - Signal contribution summary showing how much the time series signal influences model output
 """
 
 import argparse
@@ -39,7 +39,7 @@ sys.path.insert(0, str(script_dir / 'src'))
 sys.path.insert(0, str(script_dir / 'src' / 'open_flamingo'))
 
 from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
-from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+from opentslm.time_series_datasets.TSQADataset import TSQADataset
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 from opentslm.model_config import PATCH_SIZE
 
@@ -73,57 +73,36 @@ def load_model(checkpoint_path: str, device: str, llm_id: str = "meta-llama/Llam
 
 
 def extract_answer(text: str) -> str:
-    """Extract the final answer from model text."""
+    """Extract MCQ answer from model output.
+
+    TSQA answers are in format (a), (b), (c).
+    Compares only first 3 characters.
+    """
     if text is None:
         return ""
-    if "Answer: " not in text:
-        return text.strip()
-    answer = text.split("Answer: ")[-1].strip()
-    answer = re.sub(r"<\|.*?\|>|<eos>$", "", answer).strip()
-    answer = re.sub(r"\.$", "", answer).strip()
-    return answer
+    text = text.strip().lower()
+
+    # Extract after "Answer:" if present
+    answer_match = re.search(r'answer:\s*(.+)', text, re.IGNORECASE)
+    if answer_match:
+        text = answer_match.group(1).strip()
+
+    # Return first 3 chars (e.g., "(a)")
+    return text[:3]
 
 
 def normalize_label(label: str) -> str:
-    """Lowercase, strip, and remove trailing punctuation."""
+    """Lowercase, strip, and take first 3 chars for MCQ comparison."""
     if label is None:
         return ""
-    return label.lower().strip().rstrip(".,!?;:")
-
-
-def evaluate_sample(ground_truth: str, prediction: str, template_id: int) -> Dict[str, Any]:
-    """Evaluate a single sample."""
-    pred_raw = extract_answer(prediction)
-    gt_raw = extract_answer(ground_truth)
-
-    pred_norm = normalize_label(pred_raw)
-    gt_norm = normalize_label(gt_raw)
-
-    possible_answers = ECGQACoTQADataset.get_possible_answers_for_template(template_id)
-    possible_answers_lower = [a.lower().strip() for a in possible_answers]
-
-    pred_supported = pred_norm in possible_answers_lower
-    gt_supported = gt_norm in possible_answers_lower
-
-    is_correct = int(pred_norm == gt_norm)
-
-    return {
-        "accuracy": is_correct,
-        "f1_score": float(is_correct),
-        "prediction_normalized": pred_norm,
-        "ground_truth_normalized": gt_norm,
-        "prediction_supported": pred_supported,
-        "ground_truth_supported": gt_supported,
-        "template_id": template_id,
-        "possible_answers": possible_answers,
-    }
+    return label.lower().strip()[:3]
 
 
 def run_evaluation(
     model: OpenTSLMFlamingo,
-    dataset: ECGQACoTQADataset,
+    dataset: TSQADataset,
     max_samples: int = None,
-    max_new_tokens: int = 400,
+    max_new_tokens: int = 40,
 ) -> Dict[str, Any]:
     """Run evaluation on the dataset with signal tracking."""
 
@@ -131,7 +110,7 @@ def run_evaluation(
     model.enable_signal_tracking()
     model.clear_signal_measurements()
 
-    # Create dataloader with proper collate_fn
+    # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -153,36 +132,43 @@ def run_evaluation(
                 break
 
             try:
-                # batch is a list with one item (batch_size=1)
                 sample = batch[0]
-                template_id = sample.get("template_id") or sample.get("cot_template_id")
 
-                # Generate prediction - model.generate expects a batch (list of samples)
+                # Generate prediction
                 predictions = model.generate(batch, max_new_tokens=max_new_tokens)
                 prediction = predictions[0] if predictions else ""
 
                 # Get ground truth
                 ground_truth = sample.get("answer", "")
 
-                # Evaluate
-                metrics = evaluate_sample(ground_truth, prediction, template_id)
+                # Extract and compare answers
+                pred_answer = extract_answer(prediction)
+                gt_answer = normalize_label(ground_truth)
+                is_correct = int(pred_answer == gt_answer)
+
+                # Get task type from post_prompt
+                post_prompt = sample.get("post_prompt", "")
+                task_match = re.search(r'Predict the (.+?) Answer:', post_prompt)
+                task_type = task_match.group(1) if task_match else "unknown"
 
                 result = {
                     "sample_idx": idx,
-                    "template_id": template_id,
+                    "task_type": task_type,
                     "ground_truth": ground_truth,
                     "prediction": prediction,
-                    "metrics": metrics,
+                    "gt_answer": gt_answer,
+                    "pred_answer": pred_answer,
+                    "accuracy": is_correct,
                 }
                 results.append(result)
 
                 # Print first few samples
                 if idx < 3:
                     print(f"\nSample {idx + 1}:")
-                    print(f"  Template: {template_id}")
-                    print(f"  Ground truth: {metrics['ground_truth_normalized']}")
-                    print(f"  Prediction: {metrics['prediction_normalized']}")
-                    print(f"  Correct: {metrics['accuracy']}")
+                    print(f"  Task: {task_type}")
+                    print(f"  Ground truth: {gt_answer}")
+                    print(f"  Prediction: {pred_answer}")
+                    print(f"  Correct: {is_correct}")
 
             except Exception as e:
                 print(f"Error processing sample {idx}: {e}")
@@ -200,86 +186,68 @@ def run_evaluation(
 
 
 def calculate_aggregate_metrics(results: List[Dict]) -> Dict[str, Any]:
-    """Calculate aggregate metrics including Macro-F1 from results."""
+    """Calculate aggregate metrics including per-task accuracy and macro-F1."""
     if not results:
         return {}
 
-    # Group by template
-    template_groups = defaultdict(list)
+    # Group by task type
+    task_groups = defaultdict(list)
     for r in results:
-        template_id = r["metrics"]["template_id"]
-        template_groups[template_id].append(r["metrics"])
+        task_groups[r["task_type"]].append(r)
 
-    # Per-template stats with F1
-    template_stats = {}
+    # Per-task stats
+    task_stats = {}
     total_correct = 0
     total_samples = 0
-    all_template_macro_f1s = []
 
-    for template_id, metrics_list in template_groups.items():
-        n_samples = len(metrics_list)
-        n_correct = sum(m["accuracy"] for m in metrics_list)
+    for task_type, task_results in task_groups.items():
+        n_samples = len(task_results)
+        n_correct = sum(r["accuracy"] for r in task_results)
         accuracy = n_correct / n_samples if n_samples > 0 else 0
 
-        # Calculate per-class F1 for this template
-        # Group by ground truth class
-        class_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
-        for m in metrics_list:
-            gt = m["ground_truth_normalized"]
-            pred = m["prediction_normalized"]
-            if pred == gt:
-                class_stats[gt]["tp"] += 1
-            else:
-                class_stats[gt]["fn"] += 1
-                class_stats[pred]["fp"] += 1
-
-        # Calculate F1 per class
-        class_f1_scores = {}
-        template_f1_sum = 0
-        valid_classes = 0
-        for class_name, stats in class_stats.items():
-            tp = stats["tp"]
-            fp = stats["fp"]
-            fn = stats["fn"]
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            class_f1_scores[class_name] = {
-                "f1": f1,
-                "precision": precision,
-                "recall": recall,
-                "support": tp + fn,
-            }
-            if tp + fn > 0:  # Only count classes that appear in ground truth
-                template_f1_sum += f1
-                valid_classes += 1
-
-        macro_f1 = template_f1_sum / valid_classes if valid_classes > 0 else 0
-
-        template_stats[template_id] = {
+        task_stats[task_type] = {
             "num_samples": n_samples,
             "accuracy": accuracy,
             "correct": n_correct,
-            "macro_f1": macro_f1,
-            "num_classes": valid_classes,
         }
 
         total_correct += n_correct
         total_samples += n_samples
-        all_template_macro_f1s.append(macro_f1)
 
     overall_accuracy = total_correct / total_samples if total_samples > 0 else 0
-    # Overall Macro-F1: average of per-template Macro-F1s (unweighted)
-    overall_macro_f1 = sum(all_template_macro_f1s) / len(all_template_macro_f1s) if all_template_macro_f1s else 0
+
+    # Per-class F1 (across all tasks)
+    class_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
+    for r in results:
+        gt = r["gt_answer"]
+        pred = r["pred_answer"]
+        if pred == gt:
+            class_stats[gt]["tp"] += 1
+        else:
+            class_stats[gt]["fn"] += 1
+            class_stats[pred]["fp"] += 1
+
+    f1_sum = 0
+    valid_classes = 0
+    for stats in class_stats.values():
+        tp, fp, fn = stats["tp"], stats["fp"], stats["fn"]
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        if tp + fn > 0:
+            f1_sum += f1
+            valid_classes += 1
+
+    macro_f1 = f1_sum / valid_classes if valid_classes > 0 else 0
 
     return {
         "overall": {
             "total_samples": total_samples,
             "total_correct": total_correct,
             "accuracy": overall_accuracy,
-            "macro_f1": overall_macro_f1,
+            "macro_f1": macro_f1,
         },
-        "per_template": template_stats,
+        "per_task": task_stats,
     }
 
 
@@ -305,12 +273,12 @@ def print_metrics_table(signal_summary: Dict, aggregate_metrics: Dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate OpenTSLMFlamingo on ECG-QA with signal tracking")
+    parser = argparse.ArgumentParser(description="Evaluate OpenTSLMFlamingo on TSQA with signal tracking")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples to evaluate (None for all)")
-    parser.add_argument("--max_new_tokens", type=int, default=400, help="Max tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=40, help="Max tokens to generate")
     parser.add_argument("--llm_id", type=str, default="meta-llama/Llama-3.2-1B", help="LLM ID")
-    parser.add_argument("--use_noise", action="store_true", help="Replace ECG signals with noise")
+    parser.add_argument("--use_noise", action="store_true", help="Replace time series signals with noise")
     parser.add_argument("--noise_type", type=str, default="gaussian", choices=["gaussian", "shuffle", "zero", "uniform"], help="Type of noise")
     parser.add_argument("--noise_seed", type=int, default=67, help="Seed for noise generation")
     parser.add_argument("--strip_stats", action="store_true", help="Strip mean/std from text descriptions when using noise")
@@ -322,22 +290,19 @@ def main():
 
     # Configure noise mode
     if args.use_noise:
-        print(f"[NOISE MODE] ECG signals will be replaced with {args.noise_type} noise (seed={args.noise_seed}, strip_stats={args.strip_stats})")
-        ECGQACoTQADataset.set_noise_mode(use_noise=True, noise_type=args.noise_type, noise_seed=args.noise_seed, strip_stats=args.strip_stats)
+        print(f"[NOISE MODE] Signals will be replaced with {args.noise_type} noise (seed={args.noise_seed}, strip_stats={args.strip_stats})")
+        TSQADataset.set_noise_mode(use_noise=True, noise_type=args.noise_type, noise_seed=args.noise_seed, strip_stats=args.strip_stats)
     else:
-        ECGQACoTQADataset.set_noise_mode(use_noise=False)
+        TSQADataset.set_noise_mode(use_noise=False)
 
     # Load model
     model = load_model(args.checkpoint, device, args.llm_id)
 
-    # Load dataset (eval_only=True for faster loading - only loads test split)
-    print("Loading ECG-QA CoT dataset (test split only)...")
-    dataset = ECGQACoTQADataset(
+    # Load dataset
+    print("Loading TSQA dataset (test split)...")
+    dataset = TSQADataset(
         split="test",
         EOS_TOKEN=model.text_tokenizer.eos_token,
-        max_samples=args.max_samples,
-        preload_processed_data=True,
-        eval_only=True,
     )
     print(f"Loaded {len(dataset)} samples")
 
@@ -355,16 +320,16 @@ def main():
     # Print compact metrics table
     print_metrics_table(eval_results["signal_contribution"], aggregate_metrics)
 
-    # Print detailed per-template breakdown
-    print(f"\nPer-Template Metrics:")
-    for template_id, stats in sorted(aggregate_metrics.get("per_template", {}).items()):
-        print(f"  Template {template_id}: Acc={stats['accuracy']:.4f}, F1={stats.get('macro_f1', 0):.4f} ({stats['correct']}/{stats['num_samples']})")
+    # Print detailed results
+    overall = aggregate_metrics.get("overall", {})
+    print(f"\nPer-Task Metrics:")
+    for task_type, stats in sorted(aggregate_metrics.get("per_task", {}).items()):
+        print(f"  {task_type}: Acc={stats['accuracy']:.4f} ({stats['correct']}/{stats['num_samples']})")
 
     # Print full signal contribution breakdown
     model.print_signal_contribution_summary()
 
     # Build compact metrics dict for JSON
-    overall = aggregate_metrics.get("overall", {})
     sig = eval_results["signal_contribution"].get("overall", {})
     G = abs(sig.get("attn_gate_tanh_mean", 0))
     A = sig.get("raw_attn_output_mean", 0)

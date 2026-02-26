@@ -54,7 +54,7 @@ dependencies = [
     "requests>=2.28",
     "einops>=0.6",
     "wfdb>=4.0",
-    "open-flamingo>=0.0.2",
+    "einops-exts>=0.0.4",
 ]
 
 [project.urls]

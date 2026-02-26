@@ -1235,7 +1235,7 @@ class CurriculumTrainer:
         """Stage 1: Multiple Choice Question Answering (TSQA).
 
         Configuration:
-        - Epochs: 20
+        - Epochs: 30
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Accuracy
@@ -1260,7 +1260,7 @@ class CurriculumTrainer:
         """Stage 2: Caption Generation (M4).
 
         Configuration:
-        - Epochs: 15
+        - Epochs: 20
         - OpenTSLMSP: encoder_lr=1e-4, projector_lr=5e-5 (lower for fine-tuning)
         - OpenTSLMFlamingo: base_lr=1e-4 (lower for fine-tuning)
         - Metric: Test loss only
@@ -1283,7 +1283,7 @@ class CurriculumTrainer:
         """Stage CoT: Chain-of-Thought Reasoning (HAR).
 
         Configuration:
-        - Epochs: 100
+        - Epochs: 30
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
@@ -1335,7 +1335,7 @@ class CurriculumTrainer:
         """Stage 5: Chain-of-Thought Reasoning (ECG QA CoT).
 
         Configuration:
-        - Epochs: 3
+        - Epochs: 60
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
@@ -1345,7 +1345,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage5_ecg_cot",
             dataset_class=ECGQACoTQADataset,
-            num_epochs=3,
+            num_epochs=60,
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1687,19 +1687,25 @@ def main():
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
     )
 
-    # ECG Noise experiment arguments (for interpretability testing)
+    # Noise experiment arguments (for interpretability testing)
     parser.add_argument(
         "--noise_type",
         type=str,
         choices=["gaussian", "shuffle", "zero", "uniform"],
         default=None,
-        help="Type of noise to inject for ECG signals (default: None = use real ECG)",
+        help="Type of noise to inject for time series signals (applies to all noise-capable stages)",
     )
     parser.add_argument(
         "--noise_seed",
         type=int,
         default=None,
         help="Random seed for noise generation (default: None = random)",
+    )
+    parser.add_argument(
+        "--strip_stats",
+        default=False,
+        action="store_true",
+        help="Strip summary statistics (mean/std) from text descriptions when using noise",
     )
     parser.add_argument(
         "--experiment_name",
@@ -1720,17 +1726,29 @@ def main():
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
 
-    # Configure noise mode for ECG experiments (if specified)
+    # Map stage names to their noise-capable dataset classes
+    NOISE_CAPABLE_DATASETS = {
+        "stage1_mcq": TSQADataset,
+        "stage3_cot": HARCoTQADataset,
+        "stage4_sleep_cot": SleepEDFCoTQADataset,
+        "stage5_ecg_cot": ECGQACoTQADataset,
+    }
+
+    # Configure noise mode for experiments (if specified)
     if args.noise_type is not None:
-        ECGQACoTQADataset.set_noise_mode(
-            use_noise=True,
-            noise_type=args.noise_type,
-            noise_seed=args.noise_seed
-        )
-        logger.info(f"ECG Noise Mode: {args.noise_type} (seed={args.noise_seed})")
+        noise_stages = [s for s in args.stages if s in NOISE_CAPABLE_DATASETS]
+        for stage_name in noise_stages:
+            NOISE_CAPABLE_DATASETS[stage_name].set_noise_mode(
+                use_noise=True,
+                noise_type=args.noise_type,
+                noise_seed=args.noise_seed,
+                strip_stats=args.strip_stats,
+            )
+        logger.info(f"Noise Mode: {args.noise_type} (seed={args.noise_seed}) for stages: {noise_stages}")
     else:
-        ECGQACoTQADataset.set_noise_mode(use_noise=False)
-        logger.info("ECG Mode: Real signals (no noise)")
+        for dataset_cls in NOISE_CAPABLE_DATASETS.values():
+            dataset_cls.set_noise_mode(use_noise=False)
+        logger.info("Mode: Real signals (no noise)")
 
     # Configure max_samples for quick testing (if specified)
     if args.max_samples is not None:
@@ -1761,12 +1779,23 @@ def main():
         trainer.results_dir = new_results_dir
         trainer._create_results_dir()
 
-        # Create symlink to stage4_sleep_cot from original location (for Stage 5)
-        stage4_source = os.path.abspath(os.path.join(original_results_dir, "stage4_sleep_cot"))
-        stage4_target = os.path.join(new_results_dir, "stage4_sleep_cot")
-        if os.path.exists(stage4_source) and not os.path.exists(stage4_target):
-            os.symlink(stage4_source, stage4_target)
-            logger.info(f"Created symlink: {stage4_target} -> {stage4_source}")
+        # Create symlinks for predecessor stages of each requested stage
+        # _create_results_dir() already created empty dirs for all stages,
+        # so we replace them with symlinks to the base results dir
+        import shutil
+        for stage in args.stages:
+            stage_idx = CURRICULUM_STAGES.index(stage)
+            if stage_idx > 0:
+                prev_stage = CURRICULUM_STAGES[stage_idx - 1]
+                prev_source = os.path.abspath(os.path.join(original_results_dir, prev_stage))
+                prev_target = os.path.join(new_results_dir, prev_stage)
+                if os.path.exists(prev_source):
+                    # Remove empty dir created by _create_results_dir if it's not already a symlink
+                    if os.path.exists(prev_target) and not os.path.islink(prev_target):
+                        shutil.rmtree(prev_target)
+                    if not os.path.exists(prev_target):
+                        os.symlink(prev_source, prev_target)
+                        logger.info(f"Created symlink: {prev_target} -> {prev_source}")
 
         logger.info(f"Results directory: {trainer.results_dir}")
 
