@@ -27,7 +27,7 @@
 # ==============================================================================
 # ECG — Block 3s out of 10s (30% blocked, avg 0.5s blocks)
 # ==============================================================================
-PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
     --checkpoint hf_checkpoints/model_checkpoint.pt \
     --use_block \
     --block_total_sec 3.0 \
@@ -73,14 +73,27 @@ PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=1 python evaluation/opents
 # ==============================================================================
 # HAR — Block 0.75s out of 2.56s (30% blocked, 50Hz)
 # ==============================================================================
-PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=2 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
     --checkpoint hf_checkpoints/har_model_checkpoint.pt \
     --use_block \
-    --block_total_sec 0.75 \
-    --block_avg_sec 0.2 \
+    --block_total_sec 2.5 \
+    --block_avg_sec 0.5 \
     --block_std_sec 0.05 \
     --block_seed 67 \
     --output results/eval_har_block_0.75s.json
+
+
+# ==============================================================================
+# TSQA — Block 30 out of ~100 data points (30% blocked, sample_rate=1 so sec=points)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=4 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_tsqa/stage1_mcq/checkpoints/best_model.pt \
+    --use_block \
+    --block_total_sec 30 \
+    --block_avg_sec 5 \
+    --block_std_sec 1 \
+    --block_seed 67 \
+    --output results/eval_tsqa_block_30pts.json
 
 
 # ==============================================================================
