@@ -57,6 +57,9 @@ class SleepEDFCoTQADataset(NoiseInjectionMixin, QADataset):
         std = max(std, min_std)
         series_norm = (series - mean) / std
 
+        # Sleep EEG: 100Hz
+        if self.__class__._use_block:
+            series_norm = self.__class__._apply_signal_blocking(series_norm, sample_rate=100.0)
         if self.__class__._use_noise:
             series_data = self.__class__._blend_with_noise(series_norm, self.__class__._noise_type).tolist()
         else:

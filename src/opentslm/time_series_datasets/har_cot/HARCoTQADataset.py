@@ -147,9 +147,14 @@ class HARCoTQADataset(NoiseInjectionMixin, QADataset):
             means.squeeze().tolist(), 
             stds.squeeze().tolist()
         )):
+            original_np = np.array(time_series)
+            # HAR accelerometer: 50Hz
+            if self.__class__._use_block:
+                original_np = self.__class__._apply_signal_blocking(original_np, sample_rate=50.0)
             if self.__class__._use_noise:
-                original_np = np.array(time_series)
                 time_series = self.__class__._blend_with_noise(original_np, self.__class__._noise_type).tolist()
+            else:
+                time_series = original_np.tolist()
 
             text_prompt = f"{time_series_label}, it has mean {mean:.4f} and std {std:.4f}:"
             prompts.append(TextTimeSeriesPrompt(text_prompt, time_series))

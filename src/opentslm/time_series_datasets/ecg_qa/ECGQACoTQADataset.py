@@ -374,7 +374,11 @@ Make sure that your last word is the answer. You MUST end your response with "An
     @classmethod
     def _process_ecg_lead(cls, ecg_path: str, lead_idx: int) -> Tuple[np.ndarray, float, float]:
         """Process and cache a single ECG lead (downsample + normalize), with optional noise injection."""
-        mode_suffix = f"_noise_{cls._noise_type}_lvl{cls._noise_level}" if cls._use_noise else ""
+        mode_suffix = ""
+        if cls._use_block:
+            mode_suffix += f"_block_{cls._block_total_sec}"
+        if cls._use_noise:
+            mode_suffix += f"_noise_{cls._noise_type}_lvl{cls._noise_level}"
         cache_key = f"{ecg_path}:lead_{lead_idx}{mode_suffix}"
         
         if cache_key not in cls._processed_ecg_cache:
@@ -412,6 +416,10 @@ Make sure that your last word is the answer. You MUST end your response with "An
                 print(f"Warning: Lead {lead_idx} in file {ecg_path} has very low std deviation ({std_val}), signal may be flat")
                 normalized_signal = downsampled_signal - mean_val
             
+            # SIGNAL BLOCKING: Replace random windows with linear interpolation
+            if cls._use_block:
+                normalized_signal = cls._apply_signal_blocking(normalized_signal, sample_rate=100.0)
+
             # NOISE INJECTION: Blend real signal with noise if enabled
             if cls._use_noise:
                 normalized_signal = cls._blend_with_noise(normalized_signal.copy(), cls._noise_type)

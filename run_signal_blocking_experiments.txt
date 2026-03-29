@@ -1,0 +1,100 @@
+################################################################################
+# Signal Blocking Experiments (real-trained models, random window blocking)
+#
+# Purpose: Evaluate how models degrade when random windows of the signal are
+# replaced with straight-line interpolation between boundary values. This
+# erases diagnostic features (QRS morphology, ST changes, etc.) while keeping
+# the signal visually continuous.
+#
+# Algorithm: For each signal, randomly place non-overlapping blocks whose
+# lengths ~ Normal(avg, std). Within each block, replace the signal with
+# linspace(signal[start], signal[end]) — a straight line.
+#
+# ECG-specific: 10s signal at 100Hz = 1000 samples
+#   Blocking 3s = 30% of the signal erased
+#   Blocking 5s = 50% of the signal erased
+#
+# Checkpoints (same as partial noise experiments):
+#   TSQA:  results/Llama_3_2_1B/OpenTSLMFlamingo_real_tsqa/stage1_mcq/checkpoints/best_model.pt
+#   HAR:   hf_checkpoints/har_model_checkpoint.pt
+#   Sleep: results/Llama_3_2_1B/OpenTSLMFlamingo_real_sleep/stage4_sleep_cot/checkpoints/best_model.pt
+#   ECG:   hf_checkpoints/model_checkpoint.pt
+#
+# First 20 samples' COT rationales saved to output JSON.
+################################################################################
+
+
+# ==============================================================================
+# ECG — Block 3s out of 10s (30% blocked, avg 0.5s blocks)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --use_block \
+    --block_total_sec 3.0 \
+    --block_avg_sec 0.5 \
+    --block_std_sec 0.1 \
+    --block_seed 67 \
+    --output results/eval_ecg_block_3s.json
+
+# ECG — Block 5s out of 10s (50% blocked, avg 0.5s blocks)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --use_block \
+    --block_total_sec 5.0 \
+    --block_avg_sec 0.5 \
+    --block_std_sec 0.1 \
+    --block_seed 67 \
+    --output results/eval_ecg_block_5s.json
+
+# ECG — Block 3s with larger blocks (avg 1.0s — fewer, longer gaps)
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --use_block \
+    --block_total_sec 3.0 \
+    --block_avg_sec 1.0 \
+    --block_std_sec 0.2 \
+    --block_seed 67 \
+    --output results/eval_ecg_block_3s_large.json
+
+
+# ==============================================================================
+# Sleep — Block 9s out of 30s (30% blocked)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=1 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_sleep/stage4_sleep_cot/checkpoints/best_model.pt \
+    --use_block \
+    --block_total_sec 9.0 \
+    --block_avg_sec 1.0 \
+    --block_std_sec 0.3 \
+    --block_seed 67 \
+    --output results/eval_sleep_block_9s.json
+
+
+# ==============================================================================
+# HAR — Block 0.75s out of 2.56s (30% blocked, 50Hz)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=2 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint hf_checkpoints/har_model_checkpoint.pt \
+    --use_block \
+    --block_total_sec 0.75 \
+    --block_avg_sec 0.2 \
+    --block_std_sec 0.05 \
+    --block_seed 67 \
+    --output results/eval_har_block_0.75s.json
+
+
+# ==============================================================================
+# ECG — Block + Noise combined (3s blocked + 30% noise on remaining)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=3 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --use_block \
+    --block_total_sec 3.0 \
+    --block_avg_sec 0.5 \
+    --block_std_sec 0.1 \
+    --block_seed 67 \
+    --use_noise \
+    --noise_type gaussian \
+    --noise_level 0.3 \
+    --noise_seed 67 \
+    --output results/eval_ecg_block_3s_noise30.json

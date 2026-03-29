@@ -251,6 +251,11 @@ def main():
     parser.add_argument("--noise_type", type=str, default="gaussian", choices=["gaussian", "shuffle", "zero", "uniform"], help="Type of noise")
     parser.add_argument("--noise_level", type=float, default=1.0, help="Noise blending level: 0.0 = pure signal, 1.0 = pure noise (default: 1.0)")
     parser.add_argument("--noise_seed", type=int, default=67, help="Seed for noise generation")
+    parser.add_argument("--use_block", action="store_true", help="Enable signal blocking (linear interpolation over random windows)")
+    parser.add_argument("--block_total_sec", type=float, default=3.0, help="Total seconds to block out")
+    parser.add_argument("--block_avg_sec", type=float, default=0.5, help="Average block duration in seconds")
+    parser.add_argument("--block_std_sec", type=float, default=0.1, help="Std of block durations in seconds")
+    parser.add_argument("--block_seed", type=int, default=67, help="Seed for signal blocking")
     parser.add_argument("--output", type=str, default=None, help="Output JSON file path")
     args = parser.parse_args()
 
@@ -264,6 +269,10 @@ def main():
         HARCoTQADataset.set_noise_mode(use_noise=True, noise_type=args.noise_type, noise_level=args.noise_level, noise_seed=args.noise_seed)
     else:
         HARCoTQADataset.set_noise_mode(use_noise=False)
+
+    if args.use_block:
+        print(f"[BLOCK MODE] total={args.block_total_sec}s, avg={args.block_avg_sec}s, std={args.block_std_sec}s, seed={args.block_seed}")
+        HARCoTQADataset.set_block_mode(use_block=True, block_total_sec=args.block_total_sec, block_avg_sec=args.block_avg_sec, block_std_sec=args.block_std_sec, block_seed=args.block_seed)
 
     # Load model
     model = load_model(args.checkpoint, device, args.llm_id)

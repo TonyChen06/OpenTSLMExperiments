@@ -79,11 +79,14 @@ class TSQADataset(NoiseInjectionMixin, QADataset):
         mean_val = means.flatten()[0].item()
         std_val = stds.flatten()[0].item()
 
+        original_np = series_norm.numpy().flatten()
+        # TSQA has no fixed sample rate; treat each point as 1 "second"
+        if self.__class__._use_block:
+            original_np = self.__class__._apply_signal_blocking(original_np, sample_rate=1.0)
         if self.__class__._use_noise:
-            original_np = series_norm.numpy().flatten()
             series_data = self.__class__._blend_with_noise(original_np, self.__class__._noise_type).tolist()
         else:
-            series_data = series_norm.tolist()
+            series_data = original_np.tolist()
 
         text_prompt = f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}."
         return [TextTimeSeriesPrompt(text_prompt, series_data)]

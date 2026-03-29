@@ -1697,6 +1697,18 @@ def main():
     parser.add_argument("--experiment_name", type=str, default=None,
                         help="Custom experiment name suffix for results directory")
 
+    # Signal blocking arguments
+    parser.add_argument("--use_block", action="store_true",
+                        help="Enable signal blocking (replace random windows with linear interpolation)")
+    parser.add_argument("--block_total_sec", type=float, default=3.0,
+                        help="Total seconds of signal to block out (default: 3.0)")
+    parser.add_argument("--block_avg_sec", type=float, default=0.5,
+                        help="Average block duration in seconds (default: 0.5)")
+    parser.add_argument("--block_std_sec", type=float, default=0.1,
+                        help="Std of block durations in seconds (default: 0.1)")
+    parser.add_argument("--block_seed", type=int, default=None,
+                        help="Random seed for signal blocking")
+
     args = parser.parse_args()
 
     # Set up global logging
@@ -1725,6 +1737,20 @@ def main():
         for dataset_cls in NOISE_CAPABLE_DATASETS.values():
             dataset_cls.set_noise_mode(use_noise=False)
         logger.info("Mode: Real signals (no noise)")
+
+    # Configure signal blocking (independent of noise)
+    if args.use_block:
+        block_stages = [s for s in args.stages if s in NOISE_CAPABLE_DATASETS]
+        for stage_name in block_stages:
+            NOISE_CAPABLE_DATASETS[stage_name].set_block_mode(
+                use_block=True,
+                block_total_sec=args.block_total_sec,
+                block_avg_sec=args.block_avg_sec,
+                block_std_sec=args.block_std_sec,
+                block_seed=args.block_seed,
+            )
+        logger.info(f"Block Mode: total={args.block_total_sec}s, avg={args.block_avg_sec}s, "
+                     f"std={args.block_std_sec}s, seed={args.block_seed} for stages: {block_stages}")
 
     # Initialize trainer
     trainer = CurriculumTrainer(
