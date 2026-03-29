@@ -8,6 +8,7 @@ from typing import List, Tuple, Literal
 import os
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.har_cot.har_cot_loader import load_har_cot_splits
 import torch
 from torch.utils.data import DataLoader
@@ -23,7 +24,13 @@ TIME_SERIES_LABELS = [
     "The following is the accelerometer data on the z-axis",
 ]
 
-class HARCoTQADataset(QADataset):
+class HARCoTQADataset(NoiseInjectionMixin, QADataset):
+    @classmethod
+    def clear_caches(cls):
+        for attr in ("loaded", "_train_dataset", "_validation_dataset", "_test_dataset"):
+            if hasattr(cls, attr):
+                delattr(cls, attr)
+
     def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str, format_sample_str: bool = False, time_series_format_function=None):
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
     
@@ -140,6 +147,10 @@ class HARCoTQADataset(QADataset):
             means.squeeze().tolist(), 
             stds.squeeze().tolist()
         )):
+            if self.__class__._use_noise:
+                original_np = np.array(time_series)
+                time_series = self.__class__._blend_with_noise(original_np, self.__class__._noise_type).tolist()
+
             text_prompt = f"{time_series_label}, it has mean {mean:.4f} and std {std:.4f}:"
             prompts.append(TextTimeSeriesPrompt(text_prompt, time_series))
         return prompts

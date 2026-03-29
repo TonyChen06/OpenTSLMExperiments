@@ -1,0 +1,67 @@
+################################################################################
+# Partial Noise Experiments (30% noise injection on real-trained models)
+#
+# Purpose: Evaluate how models trained on REAL signals degrade when the signal
+# is slightly perturbed (30% noise blended in). This tests signal reliance —
+# a model that truly reads the signal should degrade, while one that relies
+# on text metadata should be unaffected.
+#
+# Formula: output = 0.7 * real_signal + 0.3 * gaussian_noise
+#
+# Checkpoints:
+#   TSQA:  results/Llama_3_2_1B/OpenTSLMFlamingo_real_tsqa/stage1_mcq/checkpoints/best_model.pt
+#   HAR:   hf_checkpoints/har_model_checkpoint.pt
+#   Sleep: results/Llama_3_2_1B/OpenTSLMFlamingo_real_sleep/stage4_sleep_cot/checkpoints/best_model.pt
+#   ECG:   hf_checkpoints/model_checkpoint.pt
+#
+# All evals run on FULL test sets. First 20 samples' COT rationales are saved
+# to the output JSON automatically.
+################################################################################
+
+
+# ==============================================================================
+# 1. TSQA — Stage 1 MCQ (real-trained model, 30% noise at inference)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=0 python evaluation/opentslm/tsqa/evaluate_tsqa_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_tsqa/stage1_mcq/checkpoints/best_model.pt \
+    --use_noise \
+    --noise_type gaussian \
+    --noise_level 0.3 \
+    --noise_seed 67 \
+    --output results/eval_tsqa_real_model_noise30.json
+
+
+# ==============================================================================
+# 2. HAR — Stage 3 CoT (HF checkpoint, 30% noise at inference)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=1 python evaluation/opentslm/har_cot/evaluate_har_flamingo.py \
+    --checkpoint hf_checkpoints/har_model_checkpoint.pt \
+    --use_noise \
+    --noise_type gaussian \
+    --noise_level 0.3 \
+    --noise_seed 67 \
+    --output results/eval_har_real_model_noise30.json
+
+
+# ==============================================================================
+# 3. Sleep — Stage 4 CoT (real-trained model, 30% noise at inference)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=2 python evaluation/opentslm/sleep/evaluate_sleep_flamingo.py \
+    --checkpoint results/Llama_3_2_1B/OpenTSLMFlamingo_real_sleep/stage4_sleep_cot/checkpoints/best_model.pt \
+    --use_noise \
+    --noise_type gaussian \
+    --noise_level 0.3 \
+    --noise_seed 67 \
+    --output results/eval_sleep_real_model_noise30.json
+
+
+# ==============================================================================
+# 4. ECG — Stage 5 CoT (official HF checkpoint, 30% noise at inference)
+# ==============================================================================
+PYTHONPATH=src:src/open_flamingo CUDA_VISIBLE_DEVICES=3 python evaluation/opentslm/ecg_qa_cot/evaluate_ecg_flamingo.py \
+    --checkpoint hf_checkpoints/model_checkpoint.pt \
+    --use_noise \
+    --noise_type gaussian \
+    --noise_level 0.3 \
+    --noise_seed 67 \
+    --output results/eval_ecg_real_model_noise30.json

@@ -1687,11 +1687,44 @@ def main():
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
     )
 
+    # Noise injection arguments
+    parser.add_argument("--noise_type", type=str, choices=["gaussian", "shuffle", "zero", "uniform"],
+                        default=None, help="Type of noise to inject (enables noise mode)")
+    parser.add_argument("--noise_level", type=float, default=1.0,
+                        help="Noise blending level: 0.0 = pure signal, 1.0 = pure noise (default: 1.0)")
+    parser.add_argument("--noise_seed", type=int, default=None,
+                        help="Random seed for noise generation")
+    parser.add_argument("--experiment_name", type=str, default=None,
+                        help="Custom experiment name suffix for results directory")
+
     args = parser.parse_args()
 
     # Set up global logging
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
+
+    # Configure noise mode for experiments
+    NOISE_CAPABLE_DATASETS = {
+        "stage1_mcq": TSQADataset,
+        "stage3_cot": HARCoTQADataset,
+        "stage4_sleep_cot": SleepEDFCoTQADataset,
+        "stage5_ecg_cot": ECGQACoTQADataset,
+    }
+    if args.noise_type is not None:
+        noise_stages = [s for s in args.stages if s in NOISE_CAPABLE_DATASETS]
+        for stage_name in noise_stages:
+            NOISE_CAPABLE_DATASETS[stage_name].set_noise_mode(
+                use_noise=True,
+                noise_type=args.noise_type,
+                noise_level=args.noise_level,
+                noise_seed=args.noise_seed,
+            )
+        level_msg = f", level={args.noise_level}" if args.noise_level < 1.0 else ""
+        logger.info(f"Noise Mode: {args.noise_type} (seed={args.noise_seed}{level_msg}) for stages: {noise_stages}")
+    else:
+        for dataset_cls in NOISE_CAPABLE_DATASETS.values():
+            dataset_cls.set_noise_mode(use_noise=False)
+        logger.info("Mode: Real signals (no noise)")
 
     # Initialize trainer
     trainer = CurriculumTrainer(

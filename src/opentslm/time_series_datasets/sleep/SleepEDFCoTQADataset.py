@@ -8,10 +8,17 @@ from typing import List, Tuple, Literal
 import os
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.sleep.sleepedf_cot_loader import load_sleepedf_cot_splits
 import numpy as np
 
-class SleepEDFCoTQADataset(QADataset):
+class SleepEDFCoTQADataset(NoiseInjectionMixin, QADataset):
+    @classmethod
+    def clear_caches(cls):
+        for attr in ("loaded", "_train_dataset", "_validation_dataset", "_test_dataset"):
+            if hasattr(cls, attr):
+                delattr(cls, attr)
+
     def __init__(self, split: Literal["train", "test", "validation"], EOS_TOKEN: str, format_sample_str: bool = False, time_series_format_function=None):
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
 
@@ -49,9 +56,14 @@ class SleepEDFCoTQADataset(QADataset):
         min_std = 1e-6
         std = max(std, min_std)
         series_norm = (series - mean) / std
+
+        if self.__class__._use_noise:
+            series_data = self.__class__._blend_with_noise(series_norm, self.__class__._noise_type).tolist()
+        else:
+            series_data = series_norm.tolist()
+
         text_prompt = f"The following is the EEG time series, it has mean {mean:.4f} and std {std:.4f}:"
-        
-        return [TextTimeSeriesPrompt(text_prompt, series_norm.tolist())]
+        return [TextTimeSeriesPrompt(text_prompt, series_data)]
 
     @staticmethod
     def get_labels() -> List[str]:

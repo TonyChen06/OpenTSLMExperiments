@@ -10,6 +10,7 @@ from typing import List, Tuple
 from datasets import Dataset, load_dataset
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
@@ -35,7 +36,13 @@ def get_value_count(key: str, dataset: Dataset):
         print(value)
 
 
-class TSQADataset(QADataset):
+class TSQADataset(NoiseInjectionMixin, QADataset):
+    @classmethod
+    def clear_caches(cls):
+        for attr in ("loaded", "_train_dataset", "_validation_dataset", "_test_dataset"):
+            if hasattr(cls, attr):
+                delattr(cls, attr)
+
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
         # 1) Load the single built‑in "train" split (≈ 7 k rows)
         ds_full = load_dataset("ChengsenWang/TSQA", split="train")
@@ -67,12 +74,19 @@ class TSQADataset(QADataset):
 
         means = series.mean(dim=0, keepdim=True)  # shape: (n_series, 1)
         stds = series.std(dim=0, keepdim=True)  # shape: (n_series, 1)
-        series = (series - means) / (stds + 1e-8)  # broadcasts to (n_series, length)
+        series_norm = (series - means) / (stds + 1e-8)  # broadcasts to (n_series, length)
         # TSQA has always only one time series
-        # Make tensor indexing more robust
         mean_val = means.flatten()[0].item()
         std_val = stds.flatten()[0].item()
-        return [TextTimeSeriesPrompt(f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}.", series.tolist())]
+
+        if self.__class__._use_noise:
+            original_np = series_norm.numpy().flatten()
+            series_data = self.__class__._blend_with_noise(original_np, self.__class__._noise_type).tolist()
+        else:
+            series_data = series_norm.tolist()
+
+        text_prompt = f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}."
+        return [TextTimeSeriesPrompt(text_prompt, series_data)]
 
 
 if __name__ == "__main__":

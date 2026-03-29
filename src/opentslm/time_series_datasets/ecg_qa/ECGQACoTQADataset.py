@@ -8,10 +8,11 @@ from typing import List, Tuple, Literal
 import os
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.QADataset import QADataset
+from opentslm.time_series_datasets.noise_mixin import NoiseInjectionMixin
 from opentslm.time_series_datasets.ecg_qa.ecgqa_cot_loader import load_ecg_qa_cot_splits
 import numpy as np
 
-class ECGQACoTQADataset(QADataset):
+class ECGQACoTQADataset(NoiseInjectionMixin, QADataset):
     """
     ECG-QA Chain-of-Thought Dataset for question answering with electrocardiogram data.
     
@@ -372,8 +373,9 @@ Make sure that your last word is the answer. You MUST end your response with "An
     
     @classmethod
     def _process_ecg_lead(cls, ecg_path: str, lead_idx: int) -> Tuple[np.ndarray, float, float]:
-        """Process and cache a single ECG lead (downsample + normalize)."""
-        cache_key = f"{ecg_path}:lead_{lead_idx}"
+        """Process and cache a single ECG lead (downsample + normalize), with optional noise injection."""
+        mode_suffix = f"_noise_{cls._noise_type}_lvl{cls._noise_level}" if cls._use_noise else ""
+        cache_key = f"{ecg_path}:lead_{lead_idx}{mode_suffix}"
         
         if cache_key not in cls._processed_ecg_cache:
             # Load raw ECG data
@@ -410,10 +412,14 @@ Make sure that your last word is the answer. You MUST end your response with "An
                 print(f"Warning: Lead {lead_idx} in file {ecg_path} has very low std deviation ({std_val}), signal may be flat")
                 normalized_signal = downsampled_signal - mean_val
             
+            # NOISE INJECTION: Blend real signal with noise if enabled
+            if cls._use_noise:
+                normalized_signal = cls._blend_with_noise(normalized_signal.copy(), cls._noise_type)
+
             # Verify normalized signal is valid
             if np.any(np.isnan(normalized_signal)) or np.any(np.isinf(normalized_signal)):
                 raise ValueError(f"Invalid values (NaN/Inf) in normalized signal for lead {lead_idx} in file {ecg_path}")
-            
+
             # Cache the processed signal and statistics
             cls._processed_ecg_cache[cache_key] = (normalized_signal, mean_val, std_val)
         
