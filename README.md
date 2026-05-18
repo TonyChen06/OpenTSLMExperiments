@@ -60,8 +60,35 @@ Expected last line: `Successfully installed pytest-…`
 PYTHONPATH=src python scripts/cluster/common/check_env.py --gpu
 ```
 
-Expected last line: `Environment check PASSED. Ready to train.`
-Drop `--gpu` for a CPU-only check. Any `FAIL` line is what to paste back.
+The diagnostic prints (1) a context header (hostname, Python, OS, CUDA
+driver, git branch/commit, SLURM job info if any), (2) one line per
+check tagged `[ OK ]` / `[FAIL]` / `[SKIP]`, and (3) on failure, a `FIX:`
+hint for each failed check and a summary at the bottom.
+
+Exit code is `0` if everything passes, `1` if anything fails, `2` if the
+diagnostic itself crashed.
+
+**If something fails:** the FIX hint tells you what to do. If unclear,
+re-run with `--json` and send the output:
+
+```bash
+PYTHONPATH=src python scripts/cluster/common/check_env.py --gpu --json > diag.json
+```
+
+`diag.json` contains the context, per-check status + detail + fix hint +
+traceback. Pasting that one file gives Tony everything needed to ship a
+fix.
+
+Optional flags to add deeper checks:
+- `--models EleutherAI/pythia-160m EleutherAI/pythia-410m` — verify these
+  HF models are already in the local cache (compute nodes typically lack
+  internet, so weights must be prefetched on a login node).
+- `--ahri-dataset TonyChen06/AscendingHarmonicReasoningInstruction` —
+  verify the Ahri parquet is cached.
+- `--data-dir /path/to/scratch` — verify a path exists, is writable, and
+  has enough free disk.
+- `--check-distributed` — verify `torch.distributed` can initialize
+  (single-proc gloo round-trip).
 
 ### 3 — Download the dataset
 
