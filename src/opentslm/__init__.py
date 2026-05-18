@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: MIT
 
-from opentslm.model.llm.OpenTSLM import OpenTSLM
-
-__all__ = ["OpenTSLM"]
+try:
+    from opentslm.model.llm.OpenTSLM import OpenTSLM
+    __all__ = ["OpenTSLM"]
+except ImportError:
+    # open_flamingo is an optional dep; ahri / PhysicsTSLM do not need it.
+    __all__ = []
