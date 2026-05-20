@@ -38,10 +38,16 @@ from opentslm.ahri.tasks.base import AhriTask, Split
 # Test is sampled uniformly from the FULL parameter range (including the
 # held-out region). At eval time, accuracy is reported overall AND broken
 # down by the per-example `held` flag.
+#
+# `pretrain` is a separate split for the AHRI-as-pretraining transfer
+# experiment: 3k examples per task drawn from the FULL parameter range
+# (no held-out exclusion). It does not feed RQ1/RQ2; it exists only so a
+# downstream model can see the full waveform vocabulary in one pass.
 SPLIT_SIZES: dict[Split, int] = {
     "train": 6000,
     "val": 2000,
     "test": 2000,
+    "pretrain": 3000,
 }
 
 

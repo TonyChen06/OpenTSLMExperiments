@@ -31,7 +31,7 @@ from opentslm.ahri.tasks.base import AhriTask, Example, Split
 def _sample_param(rng: np.random.Generator, full_range: tuple[float, float], heldout: tuple[float, float] | None, split: Split) -> tuple[float, bool]:
     """Sample one parameter consistent with the split's distribution.
     Returns (value, held_flag)."""
-    if split == "test":
+    if split in ("test", "pretrain"):
         value = float(rng.uniform(*full_range))
         held = wf.in_heldout(value, heldout) if heldout is not None else False
         return value, held
@@ -41,7 +41,7 @@ def _sample_param(rng: np.random.Generator, full_range: tuple[float, float], hel
 
 
 def _sample_int(rng: np.random.Generator, values: list[int], heldout: list[int] | None, split: Split) -> tuple[int, bool]:
-    if split == "test":
+    if split in ("test", "pretrain"):
         v = int(rng.choice(values))
         held = (heldout is not None) and v in set(heldout)
         return v, held
@@ -109,7 +109,7 @@ class T1_2_FrequencyBand(AhriTask):
         band = self.bands[cls]
         # intersect band with the held-out exclusion (for train/val) or use the
         # full band (for test, which spans held-out).
-        if split == "test":
+        if split in ("test", "pretrain"):
             f = float(rng.uniform(*band))
             held = wf.in_heldout(f, self.heldout_freq)
             return f, held

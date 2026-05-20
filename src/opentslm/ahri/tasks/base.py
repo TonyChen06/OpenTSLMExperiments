@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-Split = Literal["train", "val", "test"]
+Split = Literal["train", "val", "test", "pretrain"]
 
 
 @dataclass

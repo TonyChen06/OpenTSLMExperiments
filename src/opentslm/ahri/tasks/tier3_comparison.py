@@ -37,7 +37,7 @@ def _sample_pair(
     """Sample (x_lo, x_hi) with |x1-x2| >= min_gap. For test, sample both
     from the full range; for train/val, exclude held-out for both."""
     for _ in range(200):
-        if split == "test":
+        if split in ("test", "pretrain"):
             x1 = float(rng.uniform(*full_range))
             x2 = float(rng.uniform(*full_range))
         else:
@@ -46,7 +46,7 @@ def _sample_pair(
         if abs(x1 - x2) >= min_gap:
             break
     lo, hi = sorted([x1, x2])
-    held = (split == "test") and (wf.in_heldout(x1, heldout) or wf.in_heldout(x2, heldout))
+    held = (split in ("test", "pretrain")) and (wf.in_heldout(x1, heldout) or wf.in_heldout(x2, heldout))
     return lo, hi, held
 
 
@@ -157,7 +157,7 @@ class T3_3_CountComparison(AhriTask):
         return sig
 
     def sample(self, rng: np.random.Generator, split: Split) -> Example:
-        if split == "test":
+        if split in ("test", "pretrain"):
             K1 = int(rng.choice(self.k_pool))
             for _ in range(50):
                 K2 = int(rng.choice(self.k_pool))
@@ -203,7 +203,7 @@ class T3_4_TemporalLag(AhriTask):
     full_range = (1.0, 20.0)
 
     def sample(self, rng: np.random.Generator, split: Split) -> Example:
-        if split == "test":
+        if split in ("test", "pretrain"):
             freq = float(rng.uniform(*self.full_range))
             held = wf.in_heldout(freq, self.heldout_freq)
         else:
