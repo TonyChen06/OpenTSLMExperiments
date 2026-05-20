@@ -1,0 +1,881 @@
+% Physics of Time-Series Language Models: Part 1, The Capability Frontier
+%
+% NOTE: This is the planning draft pasted into the project chat. The paste
+% was truncated by a length limit partway through the Appendix (Task 4.5
+% "Inter-Event Regularity"), so the appendix is incomplete from that point.
+% Everything above that point is reproduced verbatim. See the end of this
+% file for the truncation marker.
+
+\documentclass[11pt]{article}
+
+% ---- Packages ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tablefootnote}
+\usepackage{natbib}
+\usepackage{verbatim}
+
+% ---- Custom commands ----
+\newcommand{\ahri}{\textsc{Ahri}}
+\newcommand{\tslm}{TSLM}
+\newcommand{\placeholder}[1]{\textcolor{red}{[#1]}}
+\newcommand{\taskref}[1]{\S\ref{task:#1}}
+
+\title{Physics of Time-Series Language Models: Part 1, The Capability Frontier}
+
+\author{\placeholder{Authors}}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Time-Series Language Models (TSLMs) integrate continuous temporal signals as a native modality into pretrained large language models, enabling natural-language reasoning over raw waveform data. Despite growing interest, we lack a systematic understanding of their primitive capabilities. Existing evaluations rely on complex real-world benchmarks that conflate perception, reasoning, and domain knowledge, making it impossible to isolate sources of success or failure.
+
+We introduce \ahri{} (Ascending Harmonic Reasoning Instruction), a controlled evaluation framework comprising \placeholder{N} synthetic tasks organized into five tiers of increasing cognitive demand: detection, measurement, comparison, temporal reasoning, and compositional reasoning. All tasks use parametrically generated waveforms with exact ground truth.
+
+Using \ahri{}, we conduct experiments addressing two research questions. First, we map the learnability landscape: which tasks are easy, hard, or impossible for TSLMs at three model scales (Pythia-160M, Pythia-410M, Pythia-1.4B). Second, we study training dynamics under multi-task learning: in what order capabilities emerge, whether there are phase transitions, and how tasks interfere with each other.
+
+Our key findings include: \placeholder{3--4 key findings}. We release \ahri{} as an open-source benchmark to support systematic evaluation of future TSLMs.
+\end{abstract}
+
+%======================================================================
+\section{Introduction}
+\label{sec:intro}
+%======================================================================
+
+\subsection{Motivation}
+
+Time-Series Language Models (TSLMs) represent a new class of multimodal foundation models that integrate raw temporal signals---such as electrocardiograms, accelerometer streams, and EEG recordings---directly into pretrained large language models. Recent work, notably OpenTSLM \citep{langer2025opentslm}, has demonstrated that TSLMs can outperform both text-only LLMs and vision-language models on clinical reasoning tasks, with even 1B-parameter TSLMs surpassing GPT-4o on sleep staging and activity recognition.
+
+However, these evaluations tell us little about the primitive capabilities of TSLMs. When a model correctly answers a clinical question about an ECG, we cannot determine whether it succeeded because it perceived relevant signal features, relied on textual cues in the clinical context, memorized training examples, or some combination. Real-world tasks bundle perception, measurement, reasoning, and domain knowledge into a single evaluation, making it impossible to diagnose where the model succeeds and where it fails.
+
+This paper takes a different approach, inspired by the ``physics of language models'' research program \citep{allenzhu2023physics,allenzhu2024physics}, which advocates for maximally controlled, minimal experimental setups to isolate and stress-test specific model capabilities. We apply this philosophy to the multimodal TSLM setting: synthetic signals with exact ground truth, single-variable manipulation, and precise task definitions that each isolate one capability.
+
+\subsection{Research Questions}
+
+\textbf{RQ1 (Learnability).} For a taxonomy of precisely defined signal processing tasks, which tasks can TSLMs learn? How does learnability depend on model scale?
+
+\textbf{RQ2 (Training Dynamics).} When multiple tasks are learned simultaneously, in what order do capabilities emerge? Are there phase transitions? Do tasks interfere with or facilitate each other?
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{\ahri{}}, a synthetic evaluation framework with \placeholder{N} tasks organized in five tiers, all with parametrically generated signals and exact ground truth.
+    \item A \textbf{learnability map} characterizing which signal processing tasks are easy, hard, or impossible for TSLMs at three model scales.
+    \item A \textbf{training dynamics analysis} revealing the order of capability emergence, identifying phase transitions, and quantifying inter-task interference in multi-task learning.
+\end{enumerate}
+
+\subsection{Paper Organization}
+
+Section~\ref{sec:related} reviews related work. Section~\ref{sec:framework} describes the \ahri{} framework: waveform vocabulary, task taxonomy, and evaluation protocol. Section~\ref{sec:setup} describes the model architecture and training procedure. Section~\ref{sec:rq1} presents learnability results (RQ1). Section~\ref{sec:rq2} presents training dynamics results (RQ2). Section~\ref{sec:discussion} discusses implications and limitations. Section~\ref{sec:conclusion} concludes.
+
+%======================================================================
+\section{Related Work}
+\label{sec:related}
+%======================================================================
+
+\subsection{Physics of Language Models}
+
+\citet{allenzhu2023physics,allenzhu2024physics} pioneered the use of controlled, synthetic experiments to probe specific language model capabilities---knowledge storage, retrieval, reasoning chains, and compositional generalization---in isolation, rather than evaluating on complex downstream benchmarks where confounds are pervasive. Related work has applied this methodology to arithmetic reasoning \citep{nanda2023progress}, in-context learning \citep{olsson2022context}, internal representations \citep{elhage2022toy}, and the grokking phenomenon \citep{power2022grokking}. The scaling laws literature \citep{kaplan2020scaling,wei2022emergent,schaeffer2024mirage} has studied how capabilities emerge (or appear to emerge) as a function of model size, though this remains poorly understood in the multimodal setting.
+
+Our work extends this methodology to TSLMs. The synthetic-signal setting is particularly well suited because the input space is fully parametric---every property of every signal is a known, controllable quantity---enabling precise experimental control that is difficult to achieve with natural language or images. Methodologically, \ahri{} draws inspiration from CLEVR \citep{johnson2017clevr}, which decomposed visual question answering into primitive operations to diagnose model capabilities; we apply the same philosophy to the time-series modality.
+
+\subsection{Time-Series Language Models}
+
+The integration of time-series data into language models has followed several architectural paths. \citet{gruver2023large} tokenized numerical values directly as text, an approach that scales poorly with sequence length. Vision-based approaches render time series as plots for vision-language models, but \citet{langer2025opentslm} found this performed poorly on clinical tasks, suggesting plot-based representations lose fine-grained temporal information.
+
+OpenTSLM \citep{langer2025opentslm} introduced a native-modality approach, integrating time series directly into pretrained LLMs via a Perceiver Resampler and gated cross-attention, adapting the Flamingo architecture \citep{alayrac2022flamingo}. Other work has explored related ideas---reprogramming LLMs with classification heads \citep{ye2025medualtime,pillai2025time2lang} or tokenizing time series into discrete representations \citep{sivarajkumar2023clinical,kim2024ts}---but no systematic evaluation of primitive TSLM capabilities exists. All published evaluations use complex real-world tasks that conflate perception, reasoning, and domain knowledge. \ahri{} fills this gap.
+
+\subsection{Time-Series Representation Learning}
+
+Outside the LLM paradigm, PatchTST \citep{nie2023patchtst} introduced patch-based Transformer processing for time series, and foundation models such as TimesFM \citep{das2024timesfm} and Chronos \citep{ansari2024chronos} demonstrated that general-purpose time-series representations can transfer across domains---but they operate without language and cannot perform language-based reasoning. What representations these encoders learn, and how they compare to classical signal processing features, remains largely open. \ahri{} provides indirect evidence: by characterizing which perceptual tasks are easy or hard for the full TSLM system, we reveal which signal features the model has and has not learned to extract.
+
+
+%======================================================================
+\section{\ahri{}: Framework Design}
+\label{sec:framework}
+%======================================================================
+
+\subsection{Overview}
+
+\ahri{} is a synthetic evaluation framework that decomposes time-series understanding into primitive operations. Each task isolates a specific capability---detecting a trend, estimating a frequency, comparing two signals---and uses parametrically generated signals with exact, unambiguous ground truth. This design enables precise measurement of what TSLMs can and cannot do, free from the confounds of real-world data.
+
+The framework consists of three components: a waveform vocabulary (\S\ref{sec:waveforms}), a task taxonomy of \placeholder{N} tasks organized in five tiers (\S\ref{sec:tasks}), and an evaluation protocol (\S\ref{sec:eval}).
+
+\subsection{Waveform Vocabulary}
+\label{sec:waveforms}
+
+All signals are generated at a fixed sampling rate of $f_s = 200$~Hz with a fixed length of $N = 1024$ samples (5.12 seconds). Frequencies used in experiments span 1--20~Hz, well within the Nyquist limit and well above the frequency resolution floor. Signals are presented to the model without normalization; all amplitudes are generated within a standardized range so that inputs remain numerically well-conditioned without requiring per-sample statistics.
+
+\subsubsection{Primitive Waveforms}
+
+We define six parametric primitive waveforms.
+
+\paragraph{Sinusoid (with optional harmonic).}
+\begin{equation}
+    s(t) = A \sin(2\pi f t + \phi) + \alpha A \sin(4\pi f t + 2\phi)
+\end{equation}
+Parameters: amplitude $A \in [0.5, 3.0]$, frequency $f \in [1, 20]$~Hz, phase $\phi \in [0, 2\pi)$, harmonic strength $\alpha \in \{0, 0.3, 0.5\}$. Varying $\alpha$ changes the morphology of each cycle---from a clean sinusoid ($\alpha = 0$) to an asymmetric waveform ($\alpha = 0.5$)---without changing the fundamental frequency. The harmonic phase is locked to $2\phi$ to prevent time-shift equivalences between parameter settings.
+
+\paragraph{Linear ramp.}
+\begin{equation}
+    s(t) = mt + b
+\end{equation}
+Parameters: slope $m \in [-2, 2]$, offset $b \in [-1, 1]$. The simplest non-periodic structure, providing controllable trend direction and steepness.
+
+\paragraph{Gaussian pulse.}
+\begin{equation}
+    s(t) = A \exp\!\left(-\frac{(t - t_0)^2}{2\sigma^2}\right)
+\end{equation}
+Parameters: amplitude $A \in [0.5, 3.0]$, center $t_0 \in [0.5, 4.5]$~s, width $\sigma \in [0.05, 0.5]$~s. A localized transient event, providing controllable event timing, duration, and prominence.
+
+\paragraph{Step function.}
+\begin{equation}
+    s(t) = A \cdot \mathbf{1}(t > t_0)
+\end{equation}
+Parameters: amplitude $A \in [0.5, 3.0]$, transition time $t_0 \in [0.5, 4.5]$~s. An abrupt level shift; the simplest change-point.
+
+\paragraph{Chirp (linear frequency sweep).}
+\begin{equation}
+    s(t) = A \sin\!\left(2\pi\!\left(f_0 + \frac{f_1 - f_0}{2T}\,t\right)t\right)
+\end{equation}
+Parameters: amplitude $A \in [0.5, 3.0]$, start frequency $f_0 \in [1, 10]$~Hz, end frequency $f_1 \in [5, 20]$~Hz (constrained $f_1 \neq f_0$), duration $T = 5.12$~s. A signal with time-varying frequency, testing perception of temporal dynamics.
+
+\paragraph{Exponential decay.}
+\begin{equation}
+    s(t) = A e^{-\lambda t}
+\end{equation}
+Parameters: amplitude $A \in [0.5, 3.0]$, decay rate $\lambda \in [0.2, 3.0]$. Primarily used as an amplitude envelope on other waveforms.
+
+\subsubsection{Composition Rules}
+
+Primitives are combined into composite signals via three operations.
+
+\textbf{Additive composition.} $s(t) = \sum_i s_i(t)$. The primary composition rule; components are summed directly.
+
+\textbf{Amplitude modulation.} $s(t) = s_\text{carrier}(t) \cdot s_\text{envelope}(t)$. A sinusoidal carrier modulated by a slowly varying envelope (a sinusoid, exponential decay, or Gaussian). Tests multi-scale perception.
+
+\textbf{Temporal concatenation.} $s(t) = s_1(t)\cdot\mathbf{1}(t < t_\text{split}) + s_2(t)\cdot\mathbf{1}(t \geq t_\text{split})$. A signal that changes regime at a known boundary. Tests segmentation and change-point detection.
+
+\subsubsection{Amplitude Convention}
+
+Since all signals are synthetic and we control the generating parameters, we do not apply any normalization (no z-scoring, no min-max scaling). Amplitudes are generated within a fixed, well-conditioned range (roughly $[-5, 5]$) by constraining the parameter ranges of each primitive. No signal statistics (mean, standard deviation) are provided to the model as text tokens.
+
+This is a deliberate design decision. Providing statistics as text creates a confound: the model might answer amplitude- or scale-related questions by reading numbers from the text rather than perceiving the signal. By omitting statistics, we ensure that all answers must derive from the signal pathway.
+
+
+\subsection{Task Taxonomy}
+\label{sec:tasks}
+
+We define \placeholder{N} tasks organized in five tiers. Each tier corresponds to an increasing level of cognitive demand: perceiving a property (Tier~1), measuring it quantitatively (Tier~2), comparing it across signals (Tier~3), tracking how it changes over time (Tier~4), and combining multiple capabilities (Tier~5).
+
+For each task, we generate a dataset by sampling signal parameters uniformly at random across their full specified ranges.
+
+Each dataset consists of 6{,}000 training / 2{,}000 validation / 2{,}000 test examples.
+
+\subsubsection{Held-Out Parameter Ranges}
+\label{sec:heldout}
+
+To verify that models learn genuine perceptual concepts rather than interpolating between memorized examples, we designate a \emph{held-out region} in the primary parameter space of each task (Table~\ref{tab:heldout}). Training and validation examples are sampled only from outside this region; test examples are sampled uniformly from the full range, including the held-out region. At evaluation time, we partition the test set into \emph{in-distribution} examples (parameters outside the held-out region) and \emph{held-out} examples (parameters inside it), and report accuracy on each subset separately. If held-out accuracy matches in-distribution accuracy, the model has learned the underlying concept; if it collapses, the model was pattern-matching against the training distribution.
+
+This design is inspired by the structural splits used in the physics of language models literature \citep{allenzhu2023physics}, where train and test sets are separated along a dimension that forces genuine generalization---such as reasoning complexity or entity identity---rather than randomly sampled from the same distribution.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Per-task held-out parameter regions. Training and validation data exclude these ranges; test data covers the full range.}
+\label{tab:heldout}
+\begin{tabular}{llll}
+\toprule
+\textbf{Task} & \textbf{Parameter} & \textbf{Full range} & \textbf{Held-out region} \\
+\midrule
+1.1 Trend direction   & carrier $f$   & $[3, 10]$~Hz      & $(6, 8)$~Hz \\
+1.2 Frequency band    & $f$           & $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+1.3 Periodicity       & $f$ (periodic)& $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+1.4 Event presence    & $t_0$         & $[0.5, 4.5]$~s    & $(2.0, 3.0)$~s \\
+\midrule
+2.1 Freq estimation   & $f$           & $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+2.2 Peak counting     & $K$           & $\{1,\ldots,10\}$ & $\{6, 7\}$ \\
+2.3 Event localization& $t_0$         & $[0.5, 4.5]$~s    & $(2.0, 3.0)$~s \\
+2.4 Change-point      & $t_\text{cp}$ & $[1.0, 4.0]$~s    & $(2.0, 3.0)$~s \\
+\midrule
+3.1 Freq comparison   & $f_1, f_2$    & $[1, 20]$~Hz      & either $\in (10, 15)$~Hz \\
+3.2 Ampl.\ comparison & $A_1, A_2$    & $[0.5, 3.0]$      & either $\in (1.5, 2.0)$ \\
+3.3 Count comparison  & $K_1, K_2$    & $\{1,\ldots,10\}$ & either $\in \{6, 7\}$ \\
+3.4 Temporal lag      & carrier $f$   & $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+\midrule
+4.1 Freq change dir.  & $f_0, f_1$    & $[1, 20]$~Hz      & either $\in (10, 15)$~Hz \\
+4.2 Freq change meas. & $f_0, f_1$    & $[1, 20]$~Hz      & either $\in (10, 15)$~Hz \\
+4.3 Envelope class.   & carrier $f_c$ & $[5, 15]$~Hz      & $(8, 12)$~Hz \\
+4.4 Segment labeling  & boundary $t$  & $[0.5, 4.5]$~s    & $(2.0, 3.0)$~s \\
+4.5 Regularity        & \multicolumn{3}{l}{\emph{structural diversity across regular/irregular; no single parameter}} \\
+\midrule
+5.1 2-feat conjunction& $f$ (sinusoid)& $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+5.2 3-feat conjunction& $f$ (sinusoid)& $[1, 20]$~Hz      & $(10, 15)$~Hz \\
+5.3 Anomaly ID        & base $f$      & $[1, 10]$~Hz      & $(4, 7)$~Hz \\
+5.4 Spectral decomp.  & any $f_i$     & $[1, 20]$~Hz      & any $f_i \in (10, 15)$~Hz \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%----------------------------------------------------------------------
+\subsubsection{Task Overview}
+
+Table~\ref{tab:tasksummary} summarizes all 21 tasks. Full specifications---input construction, parameter ranges, class balances, and evaluation details---are provided in Appendix~\ref{app:taskdetails}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{The 21 \ahri{} tasks organized by tier. Full specifications in Appendix~\ref{app:taskdetails}.}
+\label{tab:tasksummary}
+\begin{tabular}{llll}
+\toprule
+\textbf{Task} & \textbf{Question} & \textbf{Format} \\
+\midrule
+\multicolumn{3}{l}{\emph{Tier 1: Detection --- perceive a categorical property of one signal}} \\
+1.1 Trend direction    & Upward trend, downward, or none?           & 3-class \\
+1.2 Frequency band     & Low (1--7), medium (8--13), or high (14--20~Hz)?   & 3-class \\
+1.3 Periodicity        & Periodic or aperiodic?                     & binary \\
+1.4 Event presence     & Is there a transient pulse?                & binary \\
+\midrule
+\multicolumn{3}{l}{\emph{Tier 2: Measurement --- extract a quantitative value}} \\
+2.1 Frequency est.     & What is the frequency?                    & regression \\
+2.2 Peak counting      & How many peaks?                            & 10-class \\
+2.3 Event localization & When does the event occur?                 & regression \\
+2.4 Change-point       & When does the frequency change?            & regression \\
+\midrule
+\multicolumn{3}{l}{\emph{Tier 3: Comparison --- relate two signals}} \\
+3.1 Frequency comp.    & Which signal has higher frequency?          & binary \\
+3.2 Amplitude comp.    & Which signal has larger amplitude?          & binary \\
+3.3 Count comp.        & Which signal has more peaks?                & binary \\
+3.4 Temporal lag       & Which signal leads?                        & binary \\
+\midrule
+\multicolumn{3}{l}{\emph{Tier 4: Temporal reasoning --- track changes over time}} \\
+4.1 Freq.\ change dir. & Does frequency increase, decrease, or stay constant? & 3-class \\
+4.2 Freq.\ change meas.& What are the start and end frequencies?    & regression \\
+4.3 Envelope class.    & Envelope shape: constant, increasing, decreasing, decaying, or oscillating? & 5-class \\
+4.4 Segment labeling   & What happens in each segment?              & per-segment \\
+4.5 Regularity         & Are events regularly or irregularly spaced?& binary \\
+\midrule
+\multicolumn{3}{l}{\emph{Tier 5: Compositional reasoning --- combine multiple capabilities}} \\
+5.1 2-feature conj.    & Does it have both oscillation and trend?   & binary \\
+5.2 3-feature conj.    & Which features are present?                & multi-label \\
+5.3 Anomaly ID         & Is there an anomalous cycle? Which one?    & binary + int \\
+5.4 Spectral decomp.   & How many components, at what frequencies?  & int + list \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Tier 1 (Detection)} tests whether the model can perceive basic categorical properties of a single signal: the presence and direction of a linear trend superimposed on a periodic carrier, the frequency band of a periodic signal, whether a signal is periodic or aperiodic, and whether a transient pulse is present.
+
+\paragraph{Tier 2 (Measurement)} requires the model to extract a quantitative value and express it as a number. Evaluated with mean absolute error (MAE) and tolerance-band accuracy at task-specific thresholds.
+
+\paragraph{Tier 3 (Comparison)} presents two signals and asks the model to judge which one has more of a given property. This requires perceiving the same features as Tiers 1--2 but in a relational context. See \S\ref{sec:twosig} for how two signals are encoded.
+
+\paragraph{Tier 4 (Temporal Reasoning)} requires understanding how signal properties change over time: detecting and measuring frequency sweeps (chirps), classifying the shape of an amplitude envelope, labeling sequential segments of a concatenated signal, and judging whether events are regularly spaced.
+
+\paragraph{Tier 5 (Compositional Reasoning)} requires combining multiple capabilities: detecting the co-presence of multiple features, identifying an anomalous cycle in a periodic signal, and decomposing a signal into its frequency components.
+
+
+%----------------------------------------------------------------------
+\subsection{Evaluation Protocol}
+\label{sec:eval}
+
+\textbf{Classification tasks:} accuracy and macro-F1, reported with 95\% bootstrap confidence intervals (1{,}000 resamples).
+
+\textbf{Regression tasks:} mean absolute error (MAE) and tolerance-band accuracy at task-specific thresholds (defined per-task in \S\ref{sec:tasks}).
+
+\textbf{Solved criterion:} a task is considered solved if accuracy exceeds 95\% (classification) or tolerance-band accuracy at the tightest band exceeds 95\% (regression).
+
+\textbf{Generalization check (\S\ref{sec:generalization}):} for each task, test-set accuracy is reported separately for in-distribution and held-out parameter regions (Table~\ref{tab:heldout}).
+
+\textbf{Learning curves (\S\ref{sec:efficiency}):} performance evaluated at training set sizes $n \in \{100, 250, 500, 1000, 2500, 4000, 6000\}$.
+
+
+\subsection{Prompt Format}
+\label{sec:prompt}
+
+All tasks use a standardized prompt:
+\begin{verbatim}
+[SIGNAL TOKENS]
+Question: {task question}
+Answer:
+\end{verbatim}
+
+\noindent For Tier~3 (comparison) tasks:
+\begin{verbatim}
+Signal 1:
+[SIGNAL 1 TOKENS]
+Signal 2:
+[SIGNAL 2 TOKENS]
+Question: {task question}
+Answer:
+\end{verbatim}
+
+The model generates a free-form response. For classification tasks, the answer is extracted by string matching against valid labels. For regression tasks, the first number in the response is extracted.
+
+We do not use chain-of-thought prompting. CoT introduces a confound between perception quality and reasoning quality; the interaction between CoT and task performance is deferred to future work.
+
+
+%======================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+%======================================================================
+
+\subsection{Model Architecture}
+
+Inspired by encoder-free approaches to multimodal LLMs \citep{han2026elf}, we use a minimal architecture that integrates time-series signals into the LLM via a single learned linear projection. This avoids the confounds introduced by complex encoder pipelines (separate Transformer encoders, Perceiver Resamplers, cross-attention layers), ensuring that our results reflect what the LLM can extract from raw signal patches rather than what a specialized encoder feeds it.
+
+The architecture is as follows:
+\begin{itemize}[nosep]
+    \item \textbf{Patch embedding:} the input signal ($N = 1024$ samples) is segmented into non-overlapping patches of size $P = 32$, yielding 32 patches. Each patch $x_i \in \mathbb{R}^P$ is linearly projected to the LLM's hidden dimension: $h_i = Wx_i + b$, where $W \in \mathbb{R}^{d_\text{model} \times P}$.
+    \item \textbf{Learned positional encoding:} a learnable position embedding is added to each projected patch token.
+    \item \textbf{Integration:} the resulting 32 signal tokens are prepended to the text tokens and processed by the LLM's standard self-attention.
+    \item \textbf{LLM backbone} (fully fine-tuned): three scales from the Pythia suite \citep{biderman2023pythia}, a controlled scaling suite trained on the same data (the Pile) with the same tokenizer and architecture across all sizes, making it ideal for isolating the effect of scale:
+    \begin{itemize}[nosep]
+        \item Pythia-160M (final checkpoint)
+        \item Pythia-410M (final checkpoint)
+        \item Pythia-1.4B (final checkpoint)
+    \end{itemize}
+\end{itemize}
+
+The only learned components beyond the LLM itself are the projection matrix $W$, the bias $b$, and the positional embeddings---a deliberately minimal design. Ablation of patch size, encoder architecture, and integration strategy is deferred to future work.
+
+\subsection{Two-Signal Presentation}
+\label{sec:twosig}
+
+For Tier~3 comparison tasks, two signals are each independently patched and projected, producing two sequences of 32 signal tokens. These are concatenated with a learned separator token between them (Signal~1 tokens, separator, Signal~2 tokens) and prepended to the text tokens. Positional encodings continue incrementing across both signals (positions 0--31 for Signal~1, 32 for separator, 33--64 for Signal~2).
+
+\subsection{Training Protocol}
+
+\begin{itemize}[nosep]
+    \item Optimizer: AdamW ($\beta_1 = 0.9$, $\beta_2 = 0.999$, weight decay $= 0.01$)
+    \item Learning rate: $1\times10^{-4}$ with cosine decay schedule and 5\% linear warmup
+    \item Gradient clipping: max norm 1.0
+    \item Batch size: 32
+    \item Early stopping on validation loss with patience of 10 epochs
+    \item Datasets: pre-generated from discrete parameter grids (Appendix~\ref{app:paramgrid}); one fixed dataset per task
+    \item Decoding: greedy (temperature $= 0$)
+    \item Parse failures count as incorrect
+\end{itemize}
+
+\subsection{Baselines}
+
+\textbf{Random:} expected accuracy for a uniform random predictor, adjusted to class distribution.
+
+\textbf{Text-only LLM:} same LLM backbone with no signal input. The prompt includes only the question (no signal, no signal statistics). This confirms that the model cannot answer from the question text alone.
+
+
+%======================================================================
+\section{RQ1: Learnability Landscape}
+\label{sec:rq1}
+%======================================================================
+
+\subsection{Main Results}
+
+We train a separate single-task model for each of the \placeholder{N} tasks at each of the three model scales (Pythia-160M, Pythia-410M, Pythia-1.4B). All training uses noise-free signals.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Learnability map: per-task accuracy (classification) or MAE (regression) across three model scales. Noise-free signals. Tasks exceeding 95\% accuracy at any scale are marked as solved (\checkmark).}
+\label{tab:learnability}
+\begin{tabular}{llccccc}
+\toprule
+\textbf{Task} & \textbf{Tier} & \textbf{Format} & \textbf{Pythia-160M} & \textbf{Pythia-410M} & \textbf{Pythia-1.4B} & \textbf{Random} \\
+\midrule
+1.1 Trend direction     & 1 & 3-class   &  &  &  & 33.3 \\
+1.2 Frequency band      & 1 & 3-class   &  &  &  & 33.3 \\
+1.3 Periodicity         & 1 & binary    &  &  &  & 50.0 \\
+1.4 Event presence      & 1 & binary    &  &  &  & 50.0 \\
+\midrule
+2.1 Freq estimation     & 2 & MAE (Hz)  &  &  &  & ---  \\
+2.2 Peak counting       & 2 & 10-class  &  &  &  & 10.0 \\
+2.3 Event localization  & 2 & MAE (s)   &  &  &  & ---  \\
+2.4 Change-point        & 2 & MAE (s)   &  &  &  & ---  \\
+\midrule
+3.1 Freq comparison     & 3 & binary    &  &  &  & 50.0 \\
+3.2 Ampl.\ comparison   & 3 & binary    &  &  &  & 50.0 \\
+3.3 Count comparison    & 3 & binary    &  &  &  & 50.0 \\
+3.4 Temporal lag        & 3 & binary    &  &  &  & 50.0 \\
+\midrule
+4.1 Freq change dir.    & 4 & 3-class   &  &  &  & 33.3 \\
+4.2 Freq change meas.   & 4 & MAE (Hz)  &  &  &  & ---  \\
+4.3 Envelope class.     & 4 & 5-class   &  &  &  & 20.0 \\
+4.4 Segment labeling    & 4 & per-seg.  &  &  &  & ---  \\
+4.5 Regularity          & 4 & binary    &  &  &  & 50.0 \\
+\midrule
+5.1 2-feat conjunction  & 5 & binary    &  &  &  & 50.0 \\
+5.2 3-feat conjunction  & 5 & multi-lbl &  &  &  & ---  \\
+5.3 Anomaly ID          & 5 & bin.+int  &  &  &  & ---  \\
+5.4 Spectral decomp.    & 5 & int+list  &  &  &  & ---  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{table}[t]
+\centering
+\small
+\caption{Regression detail: tolerance-band accuracy for measurement tasks (Pythia-1.4B, noise-free).}
+\label{tab:regression}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{Tight} & \textbf{Medium} & \textbf{Loose} \\
+\midrule
+2.1 Freq est.\ ($\pm$0.5 / $\pm$1.0 / $\pm$2.0~Hz) &  &  &  \\
+2.3 Event loc.\ ($\pm$0.05 / $\pm$0.1 / $\pm$0.25~s) &  &  &  \\
+2.4 Change-pt ($\pm$0.1 / $\pm$0.25 / $\pm$0.5~s)    &  &  &  \\
+4.2 Freq change ($\pm$0.5 / $\pm$1.0 / $\pm$2.0~Hz)  &  &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\placeholder{Analysis. Key questions: Does the tier ordering match empirical difficulty? Which tasks are solved at all scales vs.\ require scale? Any tasks no model can learn? Text-only baseline at random?}
+
+\textbf{Figure~1.} \placeholder{Heatmap visualization of Table~\ref{tab:learnability}, tasks on y-axis ordered by average accuracy, model scales on x-axis.}
+
+
+\subsection{Sample Efficiency}
+\label{sec:efficiency}
+
+For six representative tasks (one per tier, plus one extra), we train the Pythia-410M model at varying dataset sizes.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Sample efficiency: accuracy at each training set size (Pythia-410M, noise-free).}
+\label{tab:sample}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Task} & \textbf{100} & \textbf{250} & \textbf{500} & \textbf{1K} & \textbf{2.5K} & \textbf{4K} & \textbf{6K} \\
+\midrule
+1.2 Freq band       &  &  &  &  &  &  &  \\
+2.1 Freq estimation  &  &  &  &  &  &  &  \\
+3.1 Freq comparison  &  &  &  &  &  &  &  \\
+4.3 Envelope class.  &  &  &  &  &  &  &  \\
+5.1 2-feat conj.     &  &  &  &  &  &  &  \\
+5.4 Spectral decomp. &  &  &  &  &  &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Figure~2.} \placeholder{Learning curves. X-axis: training set size (log scale). Y-axis: test accuracy. One line per task, with 95\% CI bands.}
+
+\placeholder{Analysis. Power-law fit $\mathrm{acc} = a - b\cdot n^{-c}$. Report exponents. Sigmoidal vs.\ smooth scaling.}
+
+
+\subsection{Generalization Check}
+\label{sec:generalization}
+
+For each task, we partition the test set into in-distribution and held-out subsets as defined in Table~\ref{tab:heldout} and report accuracy on each (\S\ref{sec:heldout}).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Generalization check: in-distribution vs.\ held-out accuracy (Pythia-1.4B). Task~4.5 has no held-out region (structural diversity prevents memorization).}
+\label{tab:generalization}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{In-dist} & \textbf{Held-out} & \textbf{$\Delta$} \\
+\midrule
+1.1 Trend direction      &  &  &  \\
+1.2 Frequency band       &  &  &  \\
+1.3 Periodicity          &  &  &  \\
+1.4 Event presence       &  &  &  \\
+\midrule
+2.1 Freq estimation      &  &  &  \\
+2.2 Peak counting        &  &  &  \\
+2.3 Event localization   &  &  &  \\
+2.4 Change-point         &  &  &  \\
+\midrule
+3.1 Freq comparison      &  &  &  \\
+3.2 Ampl.\ comparison    &  &  &  \\
+3.3 Count comparison     &  &  &  \\
+3.4 Temporal lag         &  &  &  \\
+\midrule
+4.1 Freq change dir.     &  &  &  \\
+4.2 Freq change meas.    &  &  &  \\
+4.3 Envelope class.      &  &  &  \\
+4.4 Segment labeling     &  &  &  \\
+\midrule
+5.1 2-feat conjunction   &  &  &  \\
+5.2 3-feat conjunction   &  &  &  \\
+5.3 Anomaly ID           &  &  &  \\
+5.4 Spectral decomp.     &  &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\placeholder{Analysis. Do held-out and in-distribution accuracies match? Any tasks where the model clearly fails to generalize to the held-out region? Does this vary by model scale?}
+
+
+\subsection{Summary of RQ1 Findings}
+
+\placeholder{4--6 bullet points:
+\begin{itemize}
+\item [X] of [N] tasks solved (>95\%) by the largest model
+\item Tier 1 generally easy/solved; Tier 5 hard/unsolved
+\item Scale matters most for [which tasks/tiers]
+\item Held-out accuracy [matches / does not match] in-distribution for [which tasks]
+\item Text-only baseline confirms near-random
+\end{itemize}
+}
+
+
+%======================================================================
+\section{RQ2: Training Dynamics}
+\label{sec:rq2}
+%======================================================================
+
+\subsection{Experimental Design}
+
+\paragraph{Experiment 6.1: Capability Emergence in Multi-Task Training.}
+Train a single Pythia-410M model on all \placeholder{N} tasks simultaneously. Each batch contains a uniform mixture of all tasks. At regular intervals, evaluate on all tasks separately.
+Total training steps: \placeholder{specify}.
+Evaluation frequency: every 500 steps for the first 10{,}000 steps, then every 2{,}000 steps.
+
+\paragraph{Experiment 6.2: Curriculum Effects.}
+Compare four training curricula with identical total compute:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Curriculum} & \textbf{Description} \\
+\midrule
+Simultaneous & All tasks from step 0 (uniform sampling) \\
+Easy-to-hard & Tier~1 for first 20\%; add Tier~2 at 20\%; \ldots; Tier~5 at 80\% \\
+Hard-to-easy & Reversed \\
+Random & Tasks introduced one at a time in random order, evenly spaced \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Experiment 6.3: Task Interference.}
+Select 8 representative tasks (one--two per tier). For each pair $(i, j)$:
+(1)~Train single-task on $i$ $\to$ accuracy $a_i$.
+(2)~Train single-task on $j$ $\to$ accuracy $a_j$.
+(3)~Train two-task on $i + j$ $\to$ accuracy $a_i^{(\mathrm{joint})}$, $a_j^{(\mathrm{joint})}$.
+Interference score: $I_{ij} = a_i - a_i^{(\mathrm{joint})}$ (positive = interference, negative = facilitation).
+
+For pairs with strongest interference, train sequentially (converge on $i$, switch to $j$) and track the forgetting curve on $i$.
+
+
+\subsection{Results}
+
+\subsubsection{Emergence Order}
+
+\textbf{Figure~4.} \placeholder{Training trajectory. X-axis: steps. Y-axis: test accuracy. One line per task, colored by tier.}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Capability emergence: training step at which each task first exceeds 80\% of its converged accuracy.}
+\label{tab:emergence}
+\begin{tabular}{llcl}
+\toprule
+\textbf{Task} & \textbf{Tier} & \textbf{Step at 80\%} & \textbf{Pattern} \\
+\midrule
+1.1 Trend direction      & 1 &  & smooth / sudden / grokking \\
+1.2 Frequency band       & 1 &  &  \\
+1.3 Periodicity          & 1 &  &  \\
+1.4 Event presence       & 1 &  &  \\
+\midrule
+2.1 Freq estimation      & 2 &  &  \\
+2.2 Peak counting        & 2 &  &  \\
+2.3 Event localization   & 2 &  &  \\
+2.4 Change-point         & 2 &  &  \\
+\midrule
+3.1 Freq comparison      & 3 &  &  \\
+3.2 Ampl.\ comparison    & 3 &  &  \\
+3.3 Count comparison     & 3 &  &  \\
+3.4 Temporal lag         & 3 &  &  \\
+\midrule
+4.1 Freq change dir.     & 4 &  &  \\
+4.2 Freq change meas.    & 4 &  &  \\
+4.3 Envelope class.      & 4 &  &  \\
+4.4 Segment labeling     & 4 &  &  \\
+4.5 Regularity           & 4 &  &  \\
+\midrule
+5.1 2-feat conjunction   & 5 &  &  \\
+5.2 3-feat conjunction   & 5 &  &  \\
+5.3 Anomaly ID           & 5 &  &  \\
+5.4 Spectral decomp.     & 5 &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\placeholder{Analysis. Consistent ordering? Out-of-order tasks? Sudden transitions? Grokking? Simultaneous emergence clusters?}
+
+
+\subsubsection{Curriculum Comparison}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Effect of curriculum on final accuracy, by tier.}
+\label{tab:curriculum}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Curriculum} & \textbf{Overall} & \textbf{Tier 1} & \textbf{Tier 2} & \textbf{Tier 3} & \textbf{Tier 4} & \textbf{Tier 5} \\
+\midrule
+Simultaneous  &  &  &  &  &  &  \\
+Easy-to-hard  &  &  &  &  &  &  \\
+Hard-to-easy  &  &  &  &  &  &  \\
+Random        &  &  &  &  &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Figure~5.} \placeholder{Training curves under each curriculum for 4 representative tasks.}
+
+\placeholder{Analysis. Does easy-to-hard help higher tiers? Hard-to-easy cause forgetting? Simultaneous competitive?}
+
+
+\subsubsection{Task Interference}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Task interference matrix. Entry: change in accuracy on row task when trained jointly with column task. Positive = facilitation; negative = interference.}
+\label{tab:interference}
+\begin{tabular}{lcccccccc}
+\toprule
+ & 1.2 & 2.1 & 2.2 & 3.1 & 3.4 & 4.1 & 4.3 & 5.1 \\
+\midrule
+1.2 Freq band     & --- &  &  &  &  &  &  &  \\
+2.1 Freq est.     &  & --- &  &  &  &  &  &  \\
+2.2 Peak count    &  &  & --- &  &  &  &  &  \\
+3.1 Freq comp.    &  &  &  & --- &  &  &  &  \\
+3.4 Temp.\ lag    &  &  &  &  & --- &  &  &  \\
+4.1 Freq change   &  &  &  &  &  & --- &  &  \\
+4.3 Envelope      &  &  &  &  &  &  & --- &  \\
+5.1 Conjunction   &  &  &  &  &  &  &  & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Figure~6.} \placeholder{Heatmap of interference matrix.}
+
+\placeholder{Analysis. Frequency tasks facilitate each other? Different primitives interfere? Symmetric?}
+
+
+\subsubsection{Catastrophic Forgetting}
+
+\textbf{Figure~7.} \placeholder{For 2--3 pairs with strongest interference: accuracy on task $i$ (y-axis) vs.\ training steps on task $j$ (x-axis) after switching.}
+
+\placeholder{Analysis. Speed of forgetting. Plateau above random or complete? Asymmetric?}
+
+
+\subsection{Summary of RQ2 Findings}
+
+\placeholder{4--6 bullet points:
+\begin{itemize}
+\item Tier 1 emerges within [X] steps; Tier 5 requires [Y]
+\item [These tasks] show sudden phase transitions
+\item Grokking observed / not observed for [which]
+\item Easy-to-hard curriculum [does/does not] help
+\item Frequency tasks form facilitation cluster; [X] and [Y] interfere
+\item Forgetting is [fast/slow/partial] for [which pairs]
+\end{itemize}
+}
+
+
+%======================================================================
+\section{Discussion}
+\label{sec:discussion}
+%======================================================================
+
+\subsection{What TSLMs Can and Cannot Do}
+
+\placeholder{Synthesize RQ1 and RQ2. Robust capabilities, fragile capabilities, absent capabilities. Implications for practitioners.}
+
+\subsection{Implications for Architecture Design}
+
+\placeholder{Do learnability results suggest architectural deficiencies? Encoder struggles with long-range dependencies? Language output bottleneck binding?}
+
+\subsection{Connections to Physics of Language Models}
+
+\placeholder{Comparison with Allen-Zhu \& Li. Qualitatively new phenomena in multimodal setting? Training dynamics patterns consistent with prior text-only findings?}
+
+\subsection{Limitations}
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Synthetic data only.} \ahri{} uses parametrically generated signals simpler than real-world data. The learnability map may not directly predict performance on clinical ECGs or industrial vibration data. However, controlled experimentation on synthetic data is precisely the point: we sacrifice ecological validity for interpretability.
+    \item \textbf{Fixed signal length and sampling rate.} We fix $N=1024$ at $f_s=200$~Hz. Variable-length and multi-rate signals are important but outside scope.
+    \item \textbf{Single architecture.} We use a minimal encoder-free design (linear projection). More complex encoders or integration strategies may yield different capability profiles; this is the subject of future work.
+    \item \textbf{No chain-of-thought.} We exclude CoT to isolate perception from reasoning. The interaction is an important open question.
+    \item \textbf{Limited model scales.} We test up to 1.4B parameters. Larger models may show different capability profiles across all tiers.
+\end{enumerate}
+
+\subsection{Future Work}
+
+The \ahri{} framework naturally supports several extensions:
+
+\begin{itemize}[nosep]
+    \item \textbf{Transfer and compositionality:} systematic measurement of cross-domain transfer and compositional generalization.
+    \item \textbf{Encoder ablation:} using \ahri{} as a fixed benchmark for large-scale ablation of encoder design choices.
+    \item \textbf{Language bottleneck:} studying when chain-of-thought helps vs.\ hurts, and whether internal representations capture features the model cannot express verbally.
+    \item \textbf{Real-world validation:} testing whether capability ordering on synthetic data predicts performance on clinical benchmarks.
+\end{itemize}
+
+
+%======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%======================================================================
+
+\placeholder{1 paragraph. Introduced \ahri{}, mapped learnability across [N] tasks and three scales, studied training dynamics. Key results. \ahri{} provides a foundation for systematic TSLM development.}
+
+
+%======================================================================
+\appendix
+%======================================================================
+
+\section{Detailed Task Specifications}
+\label{app:taskdetails}
+
+This appendix provides the full input construction, parameter ranges, ground truth definitions, class balances, and evaluation details for each \ahri{} task. All parameter values are sampled from discrete grids (Appendix~\ref{app:paramgrid}).
+
+\subsection{Tier 1: Detection}
+
+\paragraph{Task 1.1: Trend Presence and Direction.}
+\emph{Input:} sinusoid (random $f \in [3,10]$~Hz, $A \in [0.5,1.5]$) + optional linear ramp ($m$ sampled uniformly from $[-2,2]$ when present; absent for ``no trend'' class).
+\emph{Question:} ``Does this signal have an upward trend, a downward trend, or no trend?''
+\emph{Format:} 3-class classification \{upward, downward, none\}.
+\emph{Ground truth:} $\mathrm{sign}(m)$; ``none'' when no ramp is added.
+\emph{Class balance:} equal $1/3$.
+
+\paragraph{Task 1.2: Frequency Band Classification.}
+\emph{Input:} single sinusoid ($f$ sampled uniformly from $[1,20]$~Hz, $A \in [0.5,3.0]$).
+\emph{Question:} ``Is this signal low-frequency (1--7~Hz), medium-frequency (8--13~Hz), or high-frequency (14--20~Hz)?''
+\emph{Format:} 3-class classification \{low, medium, high\}.
+\emph{Ground truth:} determined by which interval $f$ falls in.
+\emph{Class balance:} $f$ sampled uniformly within each band.
+
+\paragraph{Task 1.3: Periodicity Detection.}
+\emph{Input:} either (a)~periodic signal---a single sinusoid (with optional harmonic, as defined in \S\ref{sec:waveforms}), or (b)~aperiodic signal---one of: linear ramp, single Gaussian pulse, or random walk (cumulative sum of i.i.d.\ Gaussian samples with $\sigma = 0.1$).
+\emph{Question:} ``Is this signal periodic or aperiodic?''
+\emph{Format:} binary classification \{periodic, aperiodic\}.
+\emph{Class balance:} 50/50.
+
+\paragraph{Task 1.4: Event Presence.}
+\emph{Input:} Gaussian noise background with $\sigma_\text{bg} \in \{0.05, 0.1, 0.15, 0.2\}$, with or without a single Gaussian pulse ($A \in [0.5, 3.0]$, $t_0 \in [0.5, 4.5]$~s, $\sigma \in [0.05, 0.5]$~s). Pulse amplitude is always well above the noise floor.
+\emph{Question:} ``Is there a transient event (a pulse or spike) in this signal?''
+\emph{Format:} binary classification \{yes, no\}.
+\emph{Class balance:} 50/50. Both classes have unlimited diversity from unique noise draws.
+
+\subsection{Tier 2: Measurement}
+
+These tasks require the model to extract a quantitative value from the signal. Evaluated with MAE and tolerance-band accuracy.
+
+\paragraph{Task 2.1: Frequency Estimation.}
+\emph{Input:} single sinusoid ($f \sim \mathrm{Uniform}[1,20]$~Hz).
+\emph{Question:} ``What is the frequency of this signal in Hz?''
+\emph{Format:} regression.
+\emph{Tolerance bands:} $\pm 0.5$, $\pm 1.0$, $\pm 2.0$~Hz.
+
+\paragraph{Task 2.2: Peak Counting.}
+\emph{Input:} sum of $K$ Gaussian pulses ($K \sim \mathrm{Uniform}\{1,\ldots,10\}$) at random locations with minimum 0.3~s inter-peak separation, random amplitudes $A \in [0.8,2.5]$, random widths $\sigma \in \{0.05, 0.10, 0.15\}$~s.
+\emph{Question:} ``How many distinct peaks are in this signal?''
+\emph{Format:} integer (treated as 10-class classification).
+\emph{Control:} text-only counting baseline (Appendix~\ref{app:counting}).
+
+\paragraph{Task 2.3: Event Localization.}
+\emph{Input:} flat background + single Gaussian pulse at center $t_0 \sim \mathrm{Uniform}[0.5,4.5]$~s.
+\emph{Question:} ``At what time (in seconds) does the event occur?''
+\emph{Format:} regression.
+\emph{Tolerance bands:} $\pm 0.05$, $\pm 0.1$, $\pm 0.25$, $\pm 0.5$~s.
+
+\paragraph{Task 2.4: Change-Point Localization.}
+\emph{Input:} temporal concatenation---sinusoid at frequency $f_1$ for $t < t_\text{cp}$, sinusoid at frequency $f_2$ for $t \geq t_\text{cp}$, where $|f_1 - f_2| \geq 1$~Hz; $t_\text{cp} \sim \mathrm{Uniform}[1.0, 4.0]$~s.
+\emph{Question:} ``At what time does the signal's frequency change?''
+\emph{Format:} regression.
+\emph{Tolerance bands:} $\pm 0.1$, $\pm 0.25$, $\pm 0.5$~s.
+
+\subsection{Tier 3: Comparison}
+
+Two signals are presented to the model (\S\ref{sec:twosig}). Assignment to Signal~1 vs.\ Signal~2 is always randomized.
+
+\paragraph{Task 3.1: Frequency Comparison.}
+\emph{Input:} two sinusoids with $f_1, f_2 \in [1,20]$~Hz, $f_1 \neq f_2$.
+\emph{Question:} ``Which signal has a higher frequency: Signal~1 or Signal~2?''
+
+\paragraph{Task 3.2: Amplitude Comparison.}
+\emph{Input:} two sinusoids at the same frequency $f$ but different amplitudes $A_1 \neq A_2$.
+\emph{Question:} ``Which signal has a larger amplitude?''
+
+\paragraph{Task 3.3: Event Count Comparison.}
+\emph{Input:} two pulse sequences with $K_1 \neq K_2$ pulses ($K_1, K_2 \in [1,10]$).
+\emph{Question:} ``Which signal has more peaks?''
+
+\paragraph{Task 3.4: Temporal Lag Detection.}
+\emph{Input:} two copies of the same sinusoid; Signal~2 is time-shifted by $\tau \sim \mathrm{Uniform}[-1.0,1.0]$~s, $|\tau| \geq 0.05$~s.
+\emph{Question:} ``Which signal leads (occurs earlier)?''
+
+\subsection{Tier 4: Temporal Reasoning}
+
+\paragraph{Task 4.1: Frequency Change Direction.}
+\emph{Input:} chirp ($f_0 \to f_1$) or constant-frequency sinusoid.
+\emph{Question:} ``Does the frequency increase, decrease, or stay constant over time?''
+\emph{Format:} 3-class. \emph{Class balance:} equal $1/3$.
+
+\paragraph{Task 4.2: Frequency Change Measurement.}
+\emph{Input:} chirp ($f_0 \to f_1$).
+\emph{Question:} ``What are the starting and ending frequencies in Hz?''
+\emph{Format:} two numbers (regression).
+\emph{Tolerance bands:} $\pm 0.5$, $\pm 1.0$, $\pm 2.0$~Hz (per estimate).
+
+\paragraph{Task 4.3: Envelope Classification.}
+\emph{Input:} amplitude-modulated sinusoid $s(t) = e(t)\cdot\sin(2\pi f_c t)$ with carrier $f_c \in [5,15]$~Hz. Envelope $e(t)$ is one of five types:
+\begin{itemize}[nosep]
+    \item Constant: $e(t) = A$, $A \in [0.5, 3.0]$
+    \item Linearly increasing: $e(t) = A_0 + \alpha t$, $A_0 \in [0.5, 1.5]$, $\alpha \in \{0.1, 0.2, 0.4, 0.6\}$
+    \item Linearly decreasing: $e(t) = A_0 - \alpha t$, $A_0 \in [1.5, 3.0]$, $\alpha \in \{0.1, 0.2, 0.4, 0.6\}$
+    \item Exponentially decaying: $e(t) = A_0 e^{-\lambda t}$, $A_0 \in [1.0, 3.0]$, $\lambda \in \{0.3, 0.5, 1.0, 2.0\}$
+    \item Sinusoidal (beating): $e(t) = A_0(1 + \beta\sin(2\pi f_m t))$, $A_0 \in [0.5, 2.0]$, $\beta \in \{0.3, 0.5, 0.7\}$, $f_m \in \{0.5, 1.0, 2.0\}$~Hz
+\end{itemize}
+Linear envelope parameters are constrained so $e(t) > 0$ for all $t \in [0, 5.12]$~s.
+\emph{Question:} ``What is the shape of this signal's amplitude envelope?''
+\emph{Answer format:} one of \{constant, increasing, decreasing, decaying, oscillating\}.
+\emph{Class balance:} equal $1/5$.
+
+\paragraph{Task 4.4: Segment Labeling.}
+\emph{Input:} temporal concatenation of 3 segments. Each segment is one of 6~types: silence (low-amplitude Gaussian noise, $\sigma = 0.05$), low-frequency sinusoid ($f \in [1,7]$~Hz), medium-frequency sinusoid ($f \in [8,13]$~Hz), high-frequency sinusoid ($f \in [14,20]$~Hz), upward ramp, or downward ramp. Adjacent segments must have different types. Two boundary times $t_1, t_2$ are sampled from a grid at 0.25~s steps, subject to minimum segment length 1.0~s.
+\emph{Question:} ``What happens in each segment? Segment 1 (0--$t_1$~s), Segment 2 ($t_1$--$t_2$~s), Segment 3 ($t_2$--5.12~s).''
+\emph{Answer format:} ``Segment 1: [label]. Segment 2: [label]. Segment 3: [label].''
+\emph{Parsing:} extract the label after each ``Segment N:'' by matching against the 6 valid type names.
+\emph{Evaluation:} per-segment accuracy (each of the 3 labels graded independently).
+
+\paragraph{Task 4.5: Inter-Event Regularity.}
+\emph{Input:} sequence of Gaussian pulses. Number of events $n \in \{3,4,5,6,7,8\}$; base interval $\Delta t \in \{0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0\}$~s; starting offset $t_\text{start} \in [0.2, 1.0]$~s at 0.1~s steps; pulse width $\sigma \in \{0.03, 0.05, 0.08\}$~s; pulse amplitude $A \in \{
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  >>> PASTE TRUNCATED HERE <<<
+%
+%  The chat paste of this draft was cut off mid-sentence in Task 4.5
+%  (inter-event regularity, pulse amplitude spec). The remainder of the
+%  appendix (rest of 4.5, all of Tier 5 task specs, Appendix on parameter
+%  grids, the counting control, and the bibliography) was not captured.
+%  Recover from the original source when available.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\end{document}
