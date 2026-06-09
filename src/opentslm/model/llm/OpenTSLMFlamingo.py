@@ -146,7 +146,13 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             # TODO: investigate also training the output embeddings when untied
 
         # additonally unfreeze encoder
-        model.vision_encoder.requires_grad_(True)
+        # Flamingo.__init__ extracts vision_encoder.visual, so vision_encoder is usually the CNN
+        # tokenizer, but in some open_flamingo versions it is a SimpleNamespace wrapper -> guard
+        # before calling requires_grad_ (otherwise AttributeError on the stub).
+        if hasattr(model.vision_encoder, "requires_grad_"):
+            model.vision_encoder.requires_grad_(True)
+        elif hasattr(model.vision_encoder, "visual") and hasattr(model.vision_encoder.visual, "requires_grad_"):
+            model.vision_encoder.visual.requires_grad_(True)
 
         self.model = model
         self.llm = model

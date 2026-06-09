@@ -11,7 +11,7 @@ BATCH_SIZE = 4
  
 PATCH_SIZE = 4
 NUM_EPOCHS = 20  # allow many but we will early‑stop
-EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs
+EARLY_STOP_PAT = 3  # stop if val loss hasn’t improved for this many epochs
 LR_ENCODER = 2e-4
 LR_PROJECTOR = 1e-4
 WEIGHT_DECAY = 1e-2

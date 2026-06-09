@@ -1231,7 +1231,7 @@ class CurriculumTrainer:
                 self._save_loss_history(stage_name, epoch, avg_train_loss, avg_val_loss)
 
                 # Early stopping - all ranks need to make the same decision
-                should_save = avg_val_loss + 1e-4 < best_val_loss
+                should_save = avg_val_loss + 0.01 < best_val_loss  # min_delta=0.01: val must drop >=0.01 to count as an improvement (else it's a "no-improvement" epoch toward patience)
                 if dist.is_initialized():
                     save_tensor = torch.tensor(
                         1 if should_save else 0, device=self.device
