@@ -35,7 +35,13 @@ class TimeSeriesFlamingoWithTrainableEncoder(Flamingo):
             
             # Process through encoder - will return [batch, patches, features]
                 
-            vision_x = self.vision_encoder(vision_x)  # Shape: [(b*T*F), patches, features]
+            # vision_encoder may be a SimpleNamespace wrapper with a .visual attribute (some
+            # open_flamingo versions) or the encoder directly -> unwrap before calling. A
+            # SimpleNamespace-wrapped encoder isn't moved by model.to(device), so place it
+            # on the input's device (idempotent after the first forward).
+            encoder = getattr(self.vision_encoder, "visual", self.vision_encoder)
+            encoder = encoder.to(vision_x.device)
+            vision_x = encoder(vision_x)  # Shape: [(b*T*F), patches, features]
                 
             # Reshape to expected format for perceiver
             # The transformer output already has the "tokens" dimension we need (patches)
