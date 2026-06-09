@@ -169,6 +169,18 @@ class CurriculumTrainer:
                 llm_id=self.llm_id,
                 device=self.device,
             ).to(self.device)
+        elif self.model_type == "MambaTSLM":
+            # OpenTSLM-Mamba: a fully-SSM TS-LLM with a quantized value-bin signal representation
+            # (LoRA r=16 + trainable bin-embeddings as its only trainable params). Implements the
+            # same TimeSeriesLLM interface as OpenTSLMSP. Imported lazily so the optional mamba-ssm
+            # backbone is only required when this model is actually selected.
+            from opentslm.model.llm.MambaTSLM import MambaTSLM
+
+            model = MambaTSLM(
+                llm_id=self.llm_id,
+                device=self.device,
+                lora_r=16,
+            ).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
@@ -265,6 +277,17 @@ class CurriculumTrainer:
                     print(f"   Projector LR: {projector_lr:.2e}")
 
             return AdamW(param_groups)
+        elif self.model_type == "MambaTSLM":
+            # Mamba trainable params = LoRA adapters + trainable bin-embeddings (the only
+            # requires_grad params; the backbone is frozen). A single LR group suffices.
+            params = [p for p in model.parameters() if p.requires_grad]
+            mamba_lr = lr_encoder if lr_encoder is not None else LR_ENCODER
+            if self.rank == 0:
+                n_params = sum(p.numel() for p in params)
+                print(f"📊 Learning rate for {self.model_type}:")
+                print(f"   LR: {mamba_lr:.2e}")
+                print(f"   Trainable params: {n_params / 1e6:.2f}M ({len(params)} tensors)")
+            return AdamW([{"params": params, "lr": mamba_lr, "weight_decay": WEIGHT_DECAY}])
         else:
             # For Flamingo, use grouped parameters
             params_to_optimize = model.named_parameters()
@@ -358,6 +381,21 @@ class CurriculumTrainer:
 
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
+        elif self.model_type == "MambaTSLM":
+            # Save only the trainable params (LoRA adapters + bin-embeddings); the frozen Mamba
+            # backbone is reloaded from the HF hub at init, so it need not live in the checkpoint.
+            trainable_state = {
+                n: p.detach().cpu()
+                for n, p in model.named_parameters()
+                if p.requires_grad
+            }
+            checkpoint = {
+                "model_state": trainable_state,
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "val_loss": val_loss,
+                "epoch": epoch,
+            }
         else:
             # Handle DDP or single GPU case for OpenTSLMFlamingo
             model_state = model.state_dict()
@@ -502,6 +540,26 @@ class CurriculumTrainer:
                     and "optimizer_state" in checkpoint
                 ):
                     optimizer.load_state_dict(checkpoint["optimizer_state"])
+            elif self.model_type == "MambaTSLM":
+                # Trainable-only checkpoint (LoRA + bin-embeddings); the frozen backbone is already
+                # loaded from the hub at init -> strict=False tolerates the unsaved frozen keys.
+                missing_keys, unexpected_keys = model.load_state_dict(
+                    checkpoint["model_state"], strict=False
+                )
+                if unexpected_keys and self.rank == 0:
+                    print(
+                        f"⚠️  Warning: Unexpected keys when loading MambaTSLM checkpoint for {stage}:"
+                    )
+                    for key in unexpected_keys[:10]:
+                        print(f"   - {key}")
+                    if len(unexpected_keys) > 10:
+                        print(f"   ... and {len(unexpected_keys) - 10} more keys")
+                if (
+                    not eval_only
+                    and optimizer is not None
+                    and "optimizer_state" in checkpoint
+                ):
+                    optimizer.load_state_dict(checkpoint["optimizer_state"])
             else:
                 # Handle DDP or single GPU case for OpenTSLMFlamingo
                 model_state = checkpoint["model_state"]
@@ -640,6 +698,20 @@ class CurriculumTrainer:
                         print(f"❌ Failed to load LoRA state from previous stage: {e}")
                     # For previous stage loading, we can be more tolerant of LoRA mismatches
                     # as stages might have different LoRA configurations
+            elif self.model_type == "MambaTSLM":
+                # Carry forward the trainable LoRA + bin-embeddings from the previous stage;
+                # strict=False tolerates the unsaved frozen backbone (loaded from the hub at init).
+                missing_keys, unexpected_keys = model.load_state_dict(
+                    checkpoint["model_state"], strict=False
+                )
+                if unexpected_keys and self.rank == 0:
+                    print(
+                        f"⚠️  Warning: Unexpected keys loading previous stage {previous_stage} (MambaTSLM):"
+                    )
+                    for key in unexpected_keys[:5]:
+                        print(f"   - {key}")
+                    if len(unexpected_keys) > 5:
+                        print(f"   ... and {len(unexpected_keys) - 5} more keys")
             else:
                 # Handle OpenTSLMFlamingo with graceful loading
                 model_state = checkpoint["model_state"]
@@ -1622,7 +1694,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["OpenTSLMSP", "OpenTSLMFlamingo"],
+        choices=["OpenTSLMSP", "OpenTSLMFlamingo", "MambaTSLM"],
         required=True,
         help="Model type to train",
     )
