@@ -1,0 +1,3 @@
+# Per-run YAML records + caches written by the harnesses
+runs/
+__pycache__/
