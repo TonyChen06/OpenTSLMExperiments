@@ -57,6 +57,15 @@ dependencies = [
     "open-flamingo>=0.0.2",
 ]
 
+[project.optional-dependencies]
+# Backbone for MambaTSLM (the fully-SSM time-series LM). These build CUDA kernels and
+# require a matching CUDA toolchain (nvcc) at install time, so they are kept optional:
+#   pip install "opentslm[mamba]"   (or: uv sync --extra mamba)
+mamba = [
+    "mamba-ssm>=2.3",
+    "causal-conv1d>=1.6",
+]
+
 [project.urls]
 Homepage = "https://opentslm.com"
 Repository = "https://github.com/StanfordBDHG/OpenTSLM"
