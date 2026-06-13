@@ -8,6 +8,8 @@ import os
 
 import json
 import os as _os
+import time
+import random
 import argparse
 from typing import List, Optional, Dict, Any, Callable
 from opentslm.time_series_datasets.TSQADataset import TSQADataset
@@ -19,6 +21,13 @@ from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
 import torch
+
+# A100 TF32: ~2-3x faster fp32 matmuls at negligible precision cost (standard practice; cudnn
+# conv TF32 is already on by default — this aligns matmuls with it).
+torch.backends.cuda.matmul.allow_tf32 = True
+# Autotune cudnn conv algorithms (SP's CNN encoder); performance-only.
+torch.backends.cudnn.benchmark = True
+
 import torch.distributed as dist
 from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
@@ -57,13 +66,18 @@ from opentslm.model_config import (
 )
 
 
-# Global stage configuration - users can modify this to mix and match stages
+# Global stage configuration - users can modify this to mix and match stages.
+# 2026-06-13 (user): M4 captioning (stage2) DROPPED — HAR-CoT now transfers directly from TSQA
+# (stage1). Removing it from this list makes _load_previous_stage_model resolve stage3's previous
+# stage to stage1_mcq. To restore the full curriculum, re-add "stage2_captioning" below.
 CURRICULUM_STAGES = [
     "stage1_mcq",
-    "stage2_captioning",
+    # "stage2_captioning",  # dropped 2026-06-13 (skip M4; HAR transfers from TSQA)
     "stage3_cot",
     "stage4_sleep_cot",
-    "stage5_ecg_cot",
+    # "stage5_ecg_cot",  # dropped 2026-06-13 (ECG-QA training not required; the long-signal
+    # capability is shown by the 12k-token feasibility probe + the paper's own Tokenized-OOM row,
+    # without a multi-day ECG leg). Re-add to restore the full curriculum.
 ]
 
 
@@ -124,6 +138,9 @@ class CurriculumTrainer:
             llm_id: LLM model ID (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')
         """
         self.model_type = model_type
+        # MambaTSLM tokenizes per VALUE (no patching): patch-size padding would append raw-0.0
+        # values that distort its per-series scaling and enter the stream as fake bin tokens.
+        self.patch_size = 1 if model_type == "MambaTSLM" else PATCH_SIZE
         self.device = device or self._get_device()
         if self.device == "mps":
             print(
@@ -168,6 +185,13 @@ class CurriculumTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
                 llm_id=self.llm_id,
                 device=self.device,
+                # Paper-faithful (arXiv 2510.02410) + consistent with OpenTSLM-SP: Flamingo's
+                # learnables = {TimeSeriesEncoder, cross-attention}; the LM input embeddings are
+                # FROZEN (SP freezes them too). The released-code default trained the full 263M
+                # embedding table — a 31%-of-trainable deviation. Verified 2026-06-13 that freezing
+                # trains at least as well (the new media tokens at frozen init are fine; cross-attn
+                # does the conditioning).
+                freeze_lm_embeddings=True,
             ).to(self.device)
         elif self.model_type == "MambaTSLM":
             # OpenTSLM-Mamba: a fully-SSM TS-LLM with a quantized value-bin signal representation
@@ -183,6 +207,17 @@ class CurriculumTrainer:
             ).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
+
+        # TSLM_COMPILE=1: torch.compile the LM backbone (~2.5x steady-state on the attention legs;
+        # static shapes settle after a ~10-15min warmup since TSQA seq-lengths are bounded). Compile
+        # the inner .llm BEFORE the DDP wrap so the compiled region sits inside DDP. Skipped for
+        # MAMBA BACKBONES (the fused selective-scan kernel doesn't play well with compile) — note
+        # llama_bins is MambaTSLM with a Llama backbone, so it DOES compile.
+        _is_mamba_backbone = "mamba" in (self.llm_id or "").lower()
+        if os.environ.get("TSLM_COMPILE") == "1" and not _is_mamba_backbone:
+            if self.rank == 0:
+                print("⚡ torch.compile on the LM backbone (TSLM_COMPILE=1)")
+            model.llm = torch.compile(model.llm)
 
         # Use DDP for multi-GPU training (simpler and than FSDP)
         if self.world_size > 1:
@@ -251,11 +286,13 @@ class CurriculumTrainer:
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
                 if lora_params:
-                    # Use projector LR for LoRA parameters (similar fine-tuning nature)
+                    # Paper (arXiv 2510.02410): "OpenTSLM-SP: Time series encoder: 2e-4,
+                    # LoRA: 2e-4, Projector: 1e-4" — LoRA trains at the ENCODER rate, not the
+                    # projector rate the repo used.
                     param_groups.append(
                         {
                             "params": lora_params,
-                            "lr": projector_lr,
+                            "lr": encoder_lr,
                             "weight_decay": WEIGHT_DECAY,
                         }
                     )
@@ -276,7 +313,7 @@ class CurriculumTrainer:
                     print(f"   Encoder LR: {encoder_lr:.2e}")
                     print(f"   Projector LR: {projector_lr:.2e}")
 
-            return AdamW(param_groups)
+            return AdamW(param_groups, fused=True)
         elif self.model_type == "MambaTSLM":
             # Mamba trainable params = LoRA adapters + trainable bin-embeddings (the only
             # requires_grad params; the backbone is frozen). A single LR group suffices.
@@ -287,7 +324,7 @@ class CurriculumTrainer:
                 print(f"📊 Learning rate for {self.model_type}:")
                 print(f"   LR: {mamba_lr:.2e}")
                 print(f"   Trainable params: {n_params / 1e6:.2f}M ({len(params)} tensors)")
-            return AdamW([{"params": params, "lr": mamba_lr, "weight_decay": WEIGHT_DECAY}])
+            return AdamW([{"params": params, "lr": mamba_lr, "weight_decay": WEIGHT_DECAY}], fused=True)
         else:
             # For Flamingo, use grouped parameters
             params_to_optimize = model.named_parameters()
@@ -320,6 +357,7 @@ class CurriculumTrainer:
                     {"params": params_without_wd, "weight_decay": 0.0},
                 ],
                 lr=base_lr,
+                fused=True,
             )
 
     def _merge_data_loaders(
@@ -332,6 +370,19 @@ class CurriculumTrainer:
     ) -> DataLoader:
         """Create a merged data loader from multiple datasets."""
         merged_ds = ConcatDataset(datasets)
+        # Uniform sample caps for tractability (stated protocol, 2026-06-13): TSLM_CAP_TRAIN /
+        # TSLM_CAP_TEST (e.g. 50000 / 10000). Keyed on `shuffle` — train loaders pass shuffle=True,
+        # val/test pass shuffle=False. A SEEDED-RANDOM subset (fixed seed → IDENTICAL subset across
+        # every model and DDP rank; avoids the first-N ordering bias of range()). The chosen subset
+        # is fixed across epochs (train reshuffles within it). TSLM_MAX_SAMPLES stays as a global
+        # fallback for smoke tests.
+        _legacy = os.environ.get("TSLM_MAX_SAMPLES")
+        _cap_env = os.environ.get("TSLM_CAP_TRAIN" if shuffle else "TSLM_CAP_TEST", _legacy)
+        cap = int(_cap_env) if _cap_env else 0
+        if cap and len(merged_ds) > cap:
+            from torch.utils.data import Subset
+            idx = sorted(random.Random(20260613).sample(range(len(merged_ds)), cap))
+            merged_ds = Subset(merged_ds, idx)
 
         # Use distributed sampler if distributed training is enabled
         if distribute_data and dist.is_initialized():
@@ -433,9 +484,44 @@ class CurriculumTrainer:
                     f"⚠️  Warning: Low disk space. Need ~{estimated_size_gb:.2f} GB, have {free_gb:.2f} GB free"
                 )
 
+        # Flamingo-ckpt forensics (TSLM_VERIFY_SAVE=1): stamp a forward FINGERPRINT into the
+        # checkpoint (live model's loss on one fixed val batch at save time). Any later reload
+        # can recompute on the same batch: mismatch => reload path defect; match => the val
+        # record itself was the artifact. (Bug context: journal 2026-06-12 — Flamingo full-state
+        # ckpts score far worse on reload than their recorded val, growing with epochs;
+        # SP/Mamba branches unaffected.)
+        if (os.environ.get("TSLM_VERIFY_SAVE") == "1"
+                and getattr(self, "_fingerprint_batch", None) is not None):
+            _m = self._get_model()
+            _was_training = _m.training
+            _m.eval()
+            with torch.no_grad():
+                checkpoint["fingerprint_loss"] = float(_m.compute_loss(self._fingerprint_batch).item())
+            if _was_training:
+                _m.train()
+            print(f"🔬 save fingerprint loss: {checkpoint['fingerprint_loss']:.6f}")
+
         # Try to save with error handling
         try:
             torch.save(checkpoint, checkpoint_path)
+            # TSLM_VERIFY_SAVE=1: immediately re-read the file and compare every tensor with
+            # the in-memory checkpoint dict (serialization-integrity check).
+            if os.environ.get("TSLM_VERIFY_SAVE") == "1":
+                _file = torch.load(checkpoint_path, map_location="cpu")
+                _bad = 0; _worst = 0.0
+                for _k, _v in checkpoint.items():
+                    if isinstance(_v, torch.Tensor):
+                        _d = ( _v.detach().float().cpu() - _file[_k].float() ).abs().max().item()
+                        if _d > 0:
+                            _bad += 1; _worst = max(_worst, _d)
+                    elif isinstance(_v, dict):
+                        for _k2, _v2 in _v.items():
+                            if isinstance(_v2, torch.Tensor):
+                                _d = (_v2.detach().float().cpu() - _file[_k][_k2].float()).abs().max().item()
+                                if _d > 0:
+                                    _bad += 1; _worst = max(_worst, _d)
+                print(f"🔬 save-verify: {_bad} tensors differ file-vs-memory (worst {_worst:.2e})")
+                del _file
         except Exception as e:
             if self.rank == 0:
                 print(f"❌ Failed to save checkpoint: {e}")
@@ -449,7 +535,10 @@ class CurriculumTrainer:
     def _save_loss_history(
         self, stage: str, epoch: int, train_loss: float, val_loss: float
     ):
-        """Save loss history to a file for tracking training progress."""
+        """Save loss history to a file for tracking training progress.
+        Elapsed_s = wall seconds since stage-training start (rank 0); with exclusive N-GPU DDP
+        legs, GPU-seconds = N x Elapsed_s — enables val-loss-vs-COMPUTE curves, not just
+        vs-epoch."""
         if dist.is_initialized() and self.rank != 0:
             return  # Only save on rank 0 for distributed training
 
@@ -459,15 +548,16 @@ class CurriculumTrainer:
         # Ensure the directory exists
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+        elapsed = time.time() - getattr(self, "_stage_train_t0", time.time())
         # Create the file with header if it doesn't exist
         if not os.path.exists(loss_history_file):
             with open(loss_history_file, "w") as f:
-                f.write("Epoch\tTrain_Loss\tVal_Loss\n")
+                f.write("Epoch\tTrain_Loss\tVal_Loss\tElapsed_s\tWorld_Size\n")
                 f.write("-" * 30 + "\n")
 
         # Append the current epoch's losses
         with open(loss_history_file, "a") as f:
-            f.write(f"{epoch}\t{train_loss:.6f}\t{val_loss:.6f}\n")
+            f.write(f"{epoch}\t{train_loss:.6f}\t{val_loss:.6f}\t{elapsed:.0f}\t{self.world_size}\n")
 
     def _display_loss_history(self, stage: str):
         """Display the loss history for a stage if available."""
@@ -615,6 +705,103 @@ class CurriculumTrainer:
                 "val_loss", float("inf")
             )
         return None, float("inf")
+
+    # ── Epoch-boundary RESUME (TSLM_RESUME=1) ───────────────────────────────────────────────
+    # A trajectory-faithful continue-from-checkpoint: preserves LR-scheduler state, AdamW
+    # moments, early-stop bookkeeping, the deterministic per-epoch shuffle (set_epoch, already
+    # called) and per-rank RNG (dropout). NOT bit-identical (fused mamba-ssm/CUDA atomics make
+    # even two same-seed uninterrupted runs differ in the last bits) but statistically
+    # indistinguishable from an uninterrupted run — proven by tslm_study/test_resume_equiv.sh.
+    # Pure addition: default-off, the best-model save/load paths are untouched.
+    def _build_resume_state(self, model):
+        """Per-model-type TRAINABLE/needed state for the latest (resume) checkpoint — mirrors the
+        structures _save_checkpoint writes for best_model.pt."""
+        if self.model_type == "OpenTSLMSP":
+            d = {"encoder_state": model.encoder.state_dict(),
+                 "projector_state": model.projector.state_dict()}
+            model.save_lora_state_to_checkpoint(d)
+            return d
+        if self.model_type == "MambaTSLM":
+            return {"model_state": {n: p.detach().cpu()
+                                    for n, p in model.named_parameters() if p.requires_grad}}
+        model_state = model.state_dict()
+        if hasattr(self.model, "module"):
+            model_state = {k.replace("module.", ""): v for k, v in model_state.items()}
+        return {"model_state": model_state}
+
+    def _apply_resume_state(self, model, ck):
+        """Inverse of _build_resume_state."""
+        if self.model_type == "OpenTSLMSP":
+            model.encoder.load_state_dict(ck["encoder_state"])
+            model.projector.load_state_dict(ck["projector_state"])
+            model.load_lora_state_from_checkpoint(ck, allow_missing=True)
+        elif self.model_type == "MambaTSLM":
+            model.load_state_dict(ck["model_state"], strict=False)
+        else:
+            state = ck["model_state"]
+            if hasattr(self.model, "module"):
+                state = {f"module.{k}": v for k, v in state.items()}
+            self.model.load_state_dict(state, strict=False)
+
+    def _save_full_checkpoint(self, stage, epoch, optimizer, scheduler,
+                              best_val_loss, best_raw_val_loss, epochs_no_improve):
+        """Write the epoch-boundary resume anchor: latest.pt (model+optimizer+scheduler+early-stop
+        counters, rank 0) and rng_rank{r}.pt (each rank's python/torch/cuda/numpy RNG)."""
+        ckpt_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        rng = {"python": random.getstate(), "torch": torch.get_rng_state(),
+               "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None}
+        try:
+            import numpy as _np
+            rng["numpy"] = _np.random.get_state()
+        except Exception:
+            rng["numpy"] = None
+        torch.save(rng, os.path.join(ckpt_dir, f"rng_rank{self.rank}.pt"))
+        if dist.is_initialized() and self.rank != 0:
+            return
+        ck = self._build_resume_state(self._get_model())
+        ck.update(optimizer_state=optimizer.state_dict(), scheduler_state=scheduler.state_dict(),
+                  epoch=epoch, best_val_loss=best_val_loss, best_raw_val_loss=best_raw_val_loss,
+                  epochs_no_improve=epochs_no_improve, world_size=self.world_size)
+        tmp = os.path.join(ckpt_dir, "latest.pt.tmp")
+        torch.save(ck, tmp)
+        os.replace(tmp, os.path.join(ckpt_dir, "latest.pt"))  # atomic: a kill mid-write can't corrupt it
+
+    def _load_full_checkpoint(self, stage, optimizer, scheduler):
+        """Resume from latest.pt. -> (next_epoch, best_val_loss, best_raw_val_loss,
+        epochs_no_improve) or None when absent / world-size mismatch."""
+        latest = os.path.join(self.results_dir, stage, "checkpoints", "latest.pt")
+        if not os.path.exists(latest):
+            return None
+        ck = torch.load(latest, map_location="cpu", weights_only=False)
+        if ck.get("world_size") != self.world_size:
+            if self.rank == 0:
+                print(f"⚠️  latest.pt world_size {ck.get('world_size')} != {self.world_size}; "
+                      "per-rank RNG/shuffle would not align — refusing to resume.")
+            return None
+        self._apply_resume_state(self._get_model(), ck)
+        optimizer.load_state_dict(ck["optimizer_state"])
+        scheduler.load_state_dict(ck["scheduler_state"])
+        return (ck["epoch"] + 1, ck["best_val_loss"],
+                ck["best_raw_val_loss"], ck["epochs_no_improve"])
+
+    def _restore_rng(self, stage):
+        """Restore THIS rank's RNG. Must be called right before the epoch loop — after all
+        model-construction RNG draws, so they don't re-advance the restored state."""
+        p = os.path.join(self.results_dir, stage, "checkpoints", f"rng_rank{self.rank}.pt")
+        if not os.path.exists(p):
+            return
+        rng = torch.load(p, map_location="cpu", weights_only=False)
+        random.setstate(rng["python"])
+        torch.set_rng_state(rng["torch"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng["cuda"])
+        if rng.get("numpy") is not None:
+            try:
+                import numpy as _np
+                _np.random.set_state(rng["numpy"])
+            except Exception:
+                pass
 
     def _load_previous_stage_model(
         self, current_stage: str
@@ -787,8 +974,10 @@ class CurriculumTrainer:
         results = []
         test_loss = 0.0
 
-        # Set higher max_tokens for generation during evaluation
-        max_new_tokens = 2000
+        # Set higher max_tokens for generation during evaluation. stage1 is multiple-choice —
+        # the answer is "(x)" (~4 tokens) and the metric parses the FIRST letter, so a 2000-token
+        # cap only lets half-trained models ramble for minutes per batch; 64 is already generous.
+        max_new_tokens = 64 if stage_name == "stage1_mcq" else 2000
 
         # Prepare per-rank streaming writer for test predictions
         results_file_rank = os.path.join(
@@ -819,7 +1008,7 @@ class CurriculumTrainer:
         try:
             with torch.no_grad():
                 for batch in tqdm(
-                    test_loader, desc=f"Evaluating {stage_name}", disable=self.rank != 0
+                    test_loader, desc=f"Evaluating {stage_name}", disable=self.rank != 0, mininterval=10
                 ):
                     # Generate predictions with higher max_tokens (skip separate loss computation)
                     predictions = self._get_model().generate(
@@ -998,6 +1187,13 @@ class CurriculumTrainer:
                 f"Eval-only mode requires a checkpoint for {stage_name}, but none found at {os.path.join(self.results_dir, stage_name, 'checkpoints', 'best_model.pt')}"
             )
 
+        # ★ Enable LoRA BEFORE loading the previous-stage checkpoint (bug fix 2026-06-13): with SP
+        # LoRA now ungated to ALL stages (paper-faithful), the previous stage's checkpoint CONTAINS
+        # LoRA adapters — so the model must have LoRA enabled before _load_previous_stage_model
+        # tries to load that LoRA state, else it fails ("checkpoint has LoRA but model has none")
+        # and the stage-1 adaptation is silently lost. (Harmless no-op for MambaTSLM/Flamingo.)
+        self._enable_lora_if_needed(stage_name)
+
         # Load previous stage model and display metrics
         try:
             previous_stage_info = self._load_previous_stage_model(stage_name)
@@ -1054,8 +1250,7 @@ class CurriculumTrainer:
 
             return metrics
 
-        # Enable LoRA if needed for this stage
-        self._enable_lora_if_needed(stage_name)
+        # (LoRA already enabled above, before the previous-stage load.)
 
         # Initialize optimizer and scheduler
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
@@ -1074,18 +1269,25 @@ class CurriculumTrainer:
                     ],
                     shuffle=True,
                     batch_size=batch_size,
-                    patch_size=PATCH_SIZE,
+                    patch_size=self.patch_size,
                     distribute_data=True,
                 )
             else:
                 train_dataset = dataset_class(
                     "train", EOS_TOKEN=self._get_model().get_eos_token()
                 )
+                # apply the train cap here too (this single-GPU BalancedBatchSampler path
+                # bypasses _merge_data_loaders); seeded-random, same as the merged path
+                _tc = os.environ.get("TSLM_CAP_TRAIN", os.environ.get("TSLM_MAX_SAMPLES"))
+                if _tc and len(train_dataset) > int(_tc):
+                    from torch.utils.data import Subset
+                    train_dataset = Subset(train_dataset, sorted(
+                        random.Random(20260613).sample(range(len(train_dataset)), int(_tc))))
                 train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=sampler,
                     collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                        batch, patch_size=PATCH_SIZE
+                        batch, patch_size=self.patch_size
                     ),
                 )
         else:
@@ -1093,23 +1295,33 @@ class CurriculumTrainer:
                 [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token())],
                 shuffle=True,
                 batch_size=batch_size,
-                patch_size=PATCH_SIZE,
+                patch_size=self.patch_size,
                 distribute_data=self.world_size > 1,
             )
+
+        # Eval batch size: batched generation is bit-/noise-equivalent to bs1 ONLY for models
+        # whose signal path is batch-invariant — MambaTSLM (pure tokens, left-pad+mask: verified
+        # 16/16) and OpenTSLMSP (after the 2026-06-13 encoder-mask + left-pad-generate fixes:
+        # verified <1% bf16 argmax noise). OpenTSLMFlamingo's encoder path is not yet mask-plumbed
+        # → keep bs1. bs1 default keeps every already-computed number valid. Override via
+        # TSLM_EVAL_BS.
+        eval_bs = int(os.environ.get("TSLM_EVAL_BS", "0")) or (
+            8 if self.model_type in ("MambaTSLM", "OpenTSLMSP") else 1
+        )
 
         val_loader = self._merge_data_loaders(
             [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token())],
             shuffle=False,
-            batch_size=1,
-            patch_size=PATCH_SIZE,
+            batch_size=eval_bs,
+            patch_size=self.patch_size,
             distribute_data=False,  # Don't distribute validation
         )
 
         test_loader = self._merge_data_loaders(
             [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token())],
             shuffle=False,
-            batch_size=1,
-            patch_size=PATCH_SIZE,
+            batch_size=eval_bs,
+            patch_size=self.patch_size,
             distribute_data=self.world_size > 1,
         )
 
@@ -1126,19 +1338,35 @@ class CurriculumTrainer:
             print(f"📈 Total training steps: {total_steps}")
             print(f"🔥 Warmup steps: {warmup_steps}")
 
-        # Load previous checkpoint if exists (for resuming current stage)
-        best_epoch, best_val_loss = self._load_checkpoint(
-            stage_name, optimizer, scheduler, eval_only=eval_only
-        )
-        if best_epoch is not None:
-            print(
-                f"📂 Resuming {stage_name} from epoch {best_epoch} (val_loss: {best_val_loss:.4f})"
-            )
-            # Display previous loss history if available
-            self._display_loss_history(stage_name)
+        # ── Trajectory-faithful epoch-boundary resume (TSLM_RESUME=1) takes precedence over the
+        # legacy best-model resume. Restores model+optimizer+scheduler+early-stop counters; RNG is
+        # restored later (right before the loop, after all model-init draws). ──
+        resumed = None
+        if os.environ.get("TSLM_RESUME") == "1" and not eval_only:
+            resumed = self._load_full_checkpoint(stage_name, optimizer, scheduler)
+        if resumed is not None:
+            start_epoch, best_val_loss, best_raw_val_loss, epochs_no_improve = resumed
+            if self.rank == 0:
+                print(f"🔁 RESUME {stage_name} from latest.pt → epoch {start_epoch} "
+                      f"(best_val {best_val_loss:.4f}, no_improve {epochs_no_improve}/{EARLY_STOP_PAT})")
+                self._display_loss_history(stage_name)
         else:
-            print(f"🆕 Starting fresh training for {stage_name}")
-            best_val_loss = float("inf")  # Ensure proper initialization
+            # Load previous checkpoint if exists (for resuming current stage)
+            best_epoch, best_val_loss = self._load_checkpoint(
+                stage_name, optimizer, scheduler, eval_only=eval_only
+            )
+            if best_epoch is not None:
+                print(
+                    f"📂 Resuming {stage_name} from epoch {best_epoch} (val_loss: {best_val_loss:.4f})"
+                )
+                # Display previous loss history if available
+                self._display_loss_history(stage_name)
+            else:
+                print(f"🆕 Starting fresh training for {stage_name}")
+                best_val_loss = float("inf")  # Ensure proper initialization
+            best_raw_val_loss = best_val_loss  # raw-best tracker for checkpoint selection (decoupled from min_delta)
+            epochs_no_improve = 0
+            start_epoch = (best_epoch + 1 if best_epoch is not None else 1)
 
         # Skip training loop if eval_only is True
         if eval_only:
@@ -1149,8 +1377,10 @@ class CurriculumTrainer:
             epochs_no_improve = 0
         else:
             # Training loop
-            epochs_no_improve = 0
-            start_epoch = best_epoch + 1 if best_epoch is not None else 1
+            num_epochs = int(os.environ.get("TSLM_MAX_EPOCHS", num_epochs))  # env override for diagnostics
+            self._stage_train_t0 = time.time()  # wall-clock anchor for the loss-history Elapsed_s column
+            if resumed is not None:  # restore RNG AFTER model build, right before the loop
+                self._restore_rng(stage_name)
             for epoch in range(start_epoch, num_epochs + 1):
                 # Set epoch for distributed sampler
                 if hasattr(train_loader.sampler, "set_epoch"):
@@ -1162,7 +1392,7 @@ class CurriculumTrainer:
                 prog = tqdm(
                     train_loader,
                     desc=f"Epoch {epoch}/{num_epochs}",
-                    disable=self.rank != 0,
+                    disable=self.rank != 0, mininterval=10,
                 )
                 for i, batch in enumerate(prog):
                     # DEBUG PRINT: Only for the first batch of the first epoch
@@ -1211,8 +1441,11 @@ class CurriculumTrainer:
                     for batch in tqdm(
                         val_loader,
                         desc=f"Validating {stage_name}",
-                        disable=self.rank != 0,
+                        disable=self.rank != 0, mininterval=10,
                     ):
+                        if (os.environ.get("TSLM_VERIFY_SAVE") == "1"
+                                and getattr(self, "_fingerprint_batch", None) is None):
+                            self._fingerprint_batch = batch  # fixed batch for save fingerprints
                         val_loss += self._get_model().compute_loss(batch).item()
 
                 avg_val_loss = val_loss / len(val_loader)
@@ -1230,34 +1463,53 @@ class CurriculumTrainer:
                 # Save loss history for this epoch
                 self._save_loss_history(stage_name, epoch, avg_train_loss, avg_val_loss)
 
-                # Early stopping - all ranks need to make the same decision
-                should_save = avg_val_loss + 0.01 < best_val_loss  # min_delta=0.01: val must drop >=0.01 to count as an improvement (else it's a "no-improvement" epoch toward patience)
+                # Diagnostic mode (TSLM_SAVE_EVERY_EPOCH=1): persist per-epoch trainable state
+                # so accuracy-vs-epoch can be swept post-hoc. MambaTSLM only (trainable-only
+                # state is small, ~0.5GB at 1.4b); rank 0 writes.
+                if (os.environ.get("TSLM_SAVE_EVERY_EPOCH") == "1"
+                        and self.model_type == "MambaTSLM" and self.rank == 0):
+                    _dm = self._get_model()
+                    _ep_state = {n: p.detach().cpu() for n, p in _dm.named_parameters() if p.requires_grad}
+                    _ep_dir = os.path.join(self.results_dir, stage_name, "checkpoints")
+                    os.makedirs(_ep_dir, exist_ok=True)
+                    torch.save({"model_state": _ep_state, "epoch": epoch},
+                               os.path.join(_ep_dir, f"epoch_{epoch:03d}.pt"))
+
+                # Early stopping - all ranks need to make the same decision.
+                # DECOUPLED (bug fix 2026-06-11): min_delta gates the PATIENCE COUNTER only
+                # (Keras semantics); the saved "best" checkpoint tracks the RAW best val loss.
+                # The coupled version refused to SAVE a strictly-better epoch whose improvement
+                # was < min_delta (mamba_14_v3 kept ep14 val .0069 over ep19 val .0038).
+                counts = avg_val_loss + 1e-4 < best_val_loss   # min_delta 1e-4 = upstream original (user final, 2026-06-11); patience only — best ckpt = raw best below
+                should_save = avg_val_loss < best_raw_val_loss  # raw best -> checkpoint selection
                 if dist.is_initialized():
-                    save_tensor = torch.tensor(
-                        1 if should_save else 0, device=self.device
+                    flags = torch.tensor(
+                        [1 if counts else 0, 1 if should_save else 0], device=self.device
                     )
-                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
-                    should_save = (
-                        save_tensor.item() > 0
-                    )  # If any rank thinks we should save, we save
+                    dist.all_reduce(flags, op=dist.ReduceOp.SUM)
+                    counts = flags[0].item() > 0
+                    should_save = flags[1].item() > 0  # If any rank thinks we should save, we save
 
                 if should_save:
-                    best_val_loss = avg_val_loss
-                    epochs_no_improve = 0
+                    best_raw_val_loss = avg_val_loss
                     self._save_checkpoint(
                         stage_name, epoch, avg_val_loss, optimizer, scheduler
                     )
                     if self.rank == 0:
-                        tqdm.write("✔️  New best model saved.\n")
+                        tqdm.write("✔️  New best model saved (raw best).\n")
+                if counts:
+                    best_val_loss = avg_val_loss
+                    epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
+                    _patience = int(os.environ.get("TSLM_PATIENCE", EARLY_STOP_PAT))
                     if self.rank == 0:
                         tqdm.write(
-                            f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n"
+                            f"No improvement for {epochs_no_improve}/{_patience} epochs.\n"
                         )
 
                     # Synchronize early stopping decision across all ranks
-                    if epochs_no_improve >= EARLY_STOP_PAT:
+                    if epochs_no_improve >= _patience:  # TSLM_PATIENCE env override for diagnostics (e.g. 999 disables early stop)
                         if self.rank == 0:
                             tqdm.write(
                                 f"\nEarly stopping triggered after {epoch} epochs."
@@ -1275,6 +1527,16 @@ class CurriculumTrainer:
                     dist.broadcast(epochs_tensor, src=0)
                     best_val_loss = best_loss_tensor.item()
                     epochs_no_improve = int(epochs_tensor.item())
+
+                # Epoch-boundary resume anchor (TSLM_RESUME=1): captures THIS epoch's end state
+                # so a kill resumes at epoch+1 with intact optimizer/scheduler/RNG/early-stop.
+                if os.environ.get("TSLM_RESUME") == "1":
+                    if dist.is_initialized():
+                        dist.barrier()  # all ranks finish the epoch before any writes its RNG
+                    self._save_full_checkpoint(
+                        stage_name, epoch, optimizer, scheduler,
+                        best_val_loss, best_raw_val_loss, epochs_no_improve,
+                    )
 
         # Load best model and evaluate
         best_epoch, _ = self._load_checkpoint(stage_name, optimizer, scheduler)
@@ -1315,7 +1577,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage1_mcq",
             dataset_class=TSQADataset,
-            num_epochs=30,
+            num_epochs=50,  # TSQA redo at 50ep (user 2026-06-13).  [prev 30/stage post-diagnostic.] Diagnostic: 1.4b best-val @ep12/17 UNDER A 200-EP-STRETCHED LR SCHEDULE (warmup alone = 20 eps); discounted to a 30-ep schedule (3-ep warmup), all models converge comfortably inside 30.
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1340,7 +1602,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage2_captioning",
             dataset_class=M4QADataset,
-            num_epochs=20,
+            num_epochs=10,  # transfer stages: shorter ceiling (user 2026-06-12); stage-1 stays 30
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1365,7 +1627,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage3_cot",
             dataset_class=HARCoTQADataset,
-            num_epochs=30,
+            num_epochs=30,  # CoT stages -> 30 (user 2026-06-13, switching to 30 for HAR/Sleep)
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1391,7 +1653,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage4_sleep_cot",
             dataset_class=SleepEDFCoTQADataset,
-            num_epochs=60,
+            num_epochs=30,  # CoT stages -> 30 (user 2026-06-13, switching to 30 for HAR/Sleep)
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1417,7 +1679,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage5_ecg_cot",
             dataset_class=ECGQACoTQADataset,
-            num_epochs=60,
+            num_epochs=10,  # transfer stages: shorter ceiling (user 2026-06-12); stage-1 stays 30
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1625,7 +1887,10 @@ class CurriculumTrainer:
         model = self._get_model()
 
         # Enable LoRA for stages after stage2_captioning
-        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
+        # Paper protocol (arXiv 2510.02410): LoRA is listed among OpenTSLM-SP's learnable
+        # weights with NO stage gating ("the TimeSeriesEncoder, MLP, and LoRA in
+        # OpenTSLM-SoftPrompt"); the stage-3+ gating existed only in the released code.
+        stages_with_lora = ["stage1_mcq", "stage2_captioning", "stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
 
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
@@ -1660,7 +1925,10 @@ class CurriculumTrainer:
         model = self._get_model()
 
         # Enable LoRA for stages after stage2_captioning
-        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
+        # Paper protocol (arXiv 2510.02410): LoRA is listed among OpenTSLM-SP's learnable
+        # weights with NO stage gating ("the TimeSeriesEncoder, MLP, and LoRA in
+        # OpenTSLM-SoftPrompt"); the stage-3+ gating existed only in the released code.
+        stages_with_lora = ["stage1_mcq", "stage2_captioning", "stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
 
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
