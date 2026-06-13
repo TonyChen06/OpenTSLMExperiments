@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+import os
 import torch
 import torch.nn as nn
 from typing import List, Dict, Tuple, Optional
@@ -40,12 +41,14 @@ class OpenTSLMSP(TimeSeriesLLM):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 2) load LLM
+        # 2) load LLM. attn_implementation via TSLM_ATTN_IMPL env (default "sdpa" = PyTorch's
+        # flash/mem-efficient kernels, same math as eager but much faster + lower memory on the
+        # O(L²) self-attention; falls back to "eager" by setting the env).
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_id,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation=os.environ.get("TSLM_ATTN_IMPL", "sdpa"),
         )
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
@@ -251,6 +254,8 @@ class OpenTSLMSP(TimeSeriesLLM):
                 ts_list.append(ts)
 
         if ts_list:
+            # True (pre-padding) length of every series — drives the batch-invariance masking.
+            ts_true_lens = [t.size(0) for t in ts_list]
             ts_padded = pad_sequence(ts_list, batch_first=True).to(
                 device, non_blocking=True
             )
@@ -263,14 +268,32 @@ class OpenTSLMSP(TimeSeriesLLM):
                 ts_padded = torch.cat([ts_padded, pad], dim=1)
             # ── now ts_padded: [N_ts_total, T_padded, 1]
 
-            # ── key fix: squeeze out the feature dim so encoder sees [B, L] ──
+            # ── BATCH-INVARIANCE FIX (2026-06-13): pad_sequence pads every series to the batch's
+            # longest, so without masking (a) the encoder's self-attention contaminates a short
+            # series' patches with the padding, and (b) the padding patches were being injected
+            # into the LLM as fake signal tokens — both make a series' soft-prompt depend on its
+            # batch-mates (measured max|Δ|≈2.0, ~50% answer flips at bs8). Mask padding patches in
+            # the encoder, and below keep only each series' REAL patches. For TSQA (lengths are
+            # multiples of patch_size) bs1 has no padding, so this exactly reproduces the bs1
+            # official numbers. ──
+            n_patches_total = ts_padded.size(1) // self.patch_size
+            real_patches = [
+                (tl + self.patch_size - 1) // self.patch_size for tl in ts_true_lens
+            ]  # ceil(true_len / patch_size)
+            patch_pad_mask = torch.ones(
+                len(ts_list), n_patches_total, dtype=torch.bool, device=device
+            )
+            for r, npr in enumerate(real_patches):
+                patch_pad_mask[r, :npr] = False  # False = real patch (attended)
+
             ts_enc = self.encoder(
-                ts_padded.squeeze(-1)
+                ts_padded.squeeze(-1), patch_padding_mask=patch_pad_mask
             )  # [N_ts_total, N_patches, embed_dim]
             ts_proj = self.projector(ts_enc).to(
                 text_embeds.dtype
             )  # [N_ts_total, N_patches, H]
         else:
+            real_patches = []
             ts_proj = torch.empty(0, 0, H, device=device, dtype=text_embeds.dtype)
 
         # 4) Re‐assemble per sample
@@ -293,7 +316,10 @@ class OpenTSLMSP(TimeSeriesLLM):
                 seq_embeds.append(sample_embeds[idx, :length, :])
                 seq_masks.append(sample_masks[idx, :length])
 
-                proj = ts_proj[ts_offset + i]  # [N_patches, H]
+                # keep only the REAL patches of this series (drop padding patches so the
+                # injected signal tokens are batch-invariant — see fix note above)
+                n_real = real_patches[ts_offset + i]
+                proj = ts_proj[ts_offset + i][:n_real]  # [n_real_patches, H]
                 seq_embeds.append(proj)
                 seq_masks.append(
                     torch.ones(proj.size(0), device=device, dtype=torch.long)
@@ -319,9 +345,27 @@ class OpenTSLMSP(TimeSeriesLLM):
         self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
     ) -> List[str]:
         inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
+        # ★ BATCHED-GENERATION FIX (2026-06-13): pad_and_apply_batch RIGHT-pads the prompt
+        # (correct for compute_loss, which masks pads). Decoder-only generation must LEFT-pad —
+        # with right padding, shorter prompts have pads BETWEEN content and the generation point,
+        # so generation continues from a pad position. Re-align padding to the left and pass
+        # explicit position_ids (HF does not derive them from the mask on the inputs_embeds path).
+        # Together with the encoder batch-invariance fix, this makes bs>1 eval match bs1.
+        B, Lp, _ = inputs_embeds.shape
+        lengths = attention_mask.long().sum(dim=1)
+        if (lengths != Lp).any():
+            emb_l = torch.zeros_like(inputs_embeds)
+            mask_l = torch.zeros_like(attention_mask)
+            for i in range(B):
+                n = int(lengths[i])
+                emb_l[i, Lp - n:] = inputs_embeds[i, :n]
+                mask_l[i, Lp - n:] = attention_mask[i, :n]
+            inputs_embeds, attention_mask = emb_l, mask_l
+        position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
         gen_ids = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             max_new_tokens=max_new_tokens,
             **generate_kwargs,
         )

@@ -65,10 +65,16 @@ class TransformerCNNEncoder(TimeSeriesEncoderBase):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, patch_padding_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: FloatTensor of shape [B, L], a batch of raw time series.
+            patch_padding_mask: optional BoolTensor [B, N] (N = L // patch_size) where True marks
+                a PADDING patch. When provided it is passed to the transformer as
+                src_key_padding_mask so real patches do not attend to padding — making the
+                encoding of a series invariant to how its batch was padded (required for correct
+                batched inference; without it, shorter series in a batch get contaminated
+                representations). Default None = legacy behavior.
         Returns:
             FloatTensor of shape [B, N, embed_dim], where N = L // patch_size.
         """
@@ -82,7 +88,7 @@ class TransformerCNNEncoder(TimeSeriesEncoderBase):
         # reshape to (B, 1, L)
         x = x.unsqueeze(1)
 
-        # conv patch embedding -> (B, embed_dim, N)
+        # conv patch embedding -> (B, embed_dim, N)  [conv is local per-patch: pad-invariant]
         x = self.patch_embed(x)
 
         # transpose to (B, N, embed_dim)
@@ -101,7 +107,7 @@ class TransformerCNNEncoder(TimeSeriesEncoderBase):
         x = self.input_norm(x)
         x = self.input_dropout(x)
 
-        # apply Transformer encoder
-        x = self.encoder(x)
+        # apply Transformer encoder (mask padding patches so real patches stay batch-invariant)
+        x = self.encoder(x, src_key_padding_mask=patch_padding_mask)
 
         return x
