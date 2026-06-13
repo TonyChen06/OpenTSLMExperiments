@@ -20,6 +20,7 @@ apples-to-apples comparison. The ``forecast`` / ``forecast_loss`` methods add th
 half: the future is just more value-bin tokens the SSM continues the stream with, dequantized
 back to data units.
 """
+import os
 from typing import Dict, List
 
 import torch
@@ -66,7 +67,13 @@ class MambaTSLM(TimeSeriesLLM):
         self.tokenizer = AutoTokenizer.from_pretrained(llm_id)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.llm = AutoModelForCausalLM.from_pretrained(llm_id, dtype=dtype).to(device)
+        # sdpa (flash/mem-efficient self-attention) for ATTENTION backbones (e.g. Llama → the
+        # attn+tokenized cell). Mamba/SSM backbones have no attention and reject the kwarg, so
+        # only pass it for non-mamba. TSLM_ATTN_IMPL overrides.
+        _kw = {}
+        if "mamba" not in llm_id.lower():
+            _kw["attn_implementation"] = os.environ.get("TSLM_ATTN_IMPL", "sdpa")
+        self.llm = AutoModelForCausalLM.from_pretrained(llm_id, dtype=dtype, **_kw).to(device)
         # Chronos-style scalar value-bin tokens (pure token in/out, head-free).
         self._init_value_bins(n_bins=n_bins, vrange=vrange, bin_mode=bin_mode, init_mode=init_mode)
 
