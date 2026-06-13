@@ -62,7 +62,9 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             trust_remote_code=True,
             cache_dir=None,
             device_map={"": device},
-            attn_implementation="eager",
+            # sdpa (flash/mem-efficient) for the frozen base LM self-attention; open_flamingo's
+            # gated CROSS-attn is a separate custom module, unaffected. TSLM_ATTN_IMPL=eager to revert.
+            attn_implementation=__import__("os").environ.get("TSLM_ATTN_IMPL", "sdpa"),
         )
 
         # add Flamingo special tokens to the tokenizer
@@ -153,6 +155,16 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             model.vision_encoder.requires_grad_(True)
         elif hasattr(model.vision_encoder, "visual") and hasattr(model.vision_encoder.visual, "requires_grad_"):
             model.vision_encoder.visual.requires_grad_(True)
+
+        # ★ BUG FIX (2026-06-12, journal §AM/AN): the SimpleNamespace wrapper is NOT an
+        # nn.Module, so the time-series encoder it hides was invisible to .parameters() and
+        # .state_dict() — it (a) NEVER entered the optimizer (stayed at random init all run,
+        # violating the paper's "TimeSeriesEncoder ... trainable"), and (b) was never saved,
+        # so every reload drew a FRESH random encoder under perceiver/gates tuned to the old
+        # one (checkpoint accuracy collapse, growing with training). Registering it as a real
+        # submodule fixes training, saving, and reloading in one move; the forward path is
+        # unchanged (vision_encoder.visual references the SAME object).
+        model.ts_encoder = time_series_encoder
 
         self.model = model
         self.llm = model
@@ -262,14 +274,20 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                     batch, include_labels=True
                 )
 
+                # open_flamingo's Flamingo.generate has a FIXED signature (no eos_token_id /
+                # pad_token_id / **kwargs) — passing them raises TypeError. It drives the
+                # underlying lang_encoder.generate with its own EOS handling; we only forward
+                # kwargs it actually supports.
+                _supported = {"num_beams", "temperature", "top_k", "top_p",
+                              "no_repeat_ngram_size", "prefix_allowed_tokens_fn",
+                              "length_penalty", "num_return_sequences", "do_sample",
+                              "early_stopping"}
                 gen_ids = self.llm.generate(
                     vision_x=images,
                     lang_x=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    eos_token_id=self.text_tokenizer.eos_token_id,
-                    pad_token_id=self.text_tokenizer.pad_token_id,
-                    **generate_kwargs,
+                    **{k: v for k, v in generate_kwargs.items() if k in _supported},
                 )
 
                 # Remove input ids from generation
