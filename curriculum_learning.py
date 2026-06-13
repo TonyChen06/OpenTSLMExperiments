@@ -66,6 +66,26 @@ from opentslm.model_config import (
 )
 
 
+# DataLoader prefetch: the torch default (num_workers=0) tokenizes/collates each batch
+# synchronously on the train process, stalling the GPU between steps with no overlap. The
+# collate is CPU-only & RNG-free and the datasets' __getitem__ have no randomness (verified
+# 2026-06-13), so background workers + pinned host memory are numerics-neutral and fully
+# deterministic — same data, same order (sampler+seed), just prefetched. Numerics-neutral so
+# it composes cleanly with the other box's sdpa/compile/fused wins. Tunable via
+# TSLM_NUM_WORKERS; set 0 to restore the old synchronous behavior. 48 cores / 4 ranks ⇒ 8
+# workers/rank (4×8=32 procs) leaves headroom.
+def _loader_perf_kwargs():
+    nw = int(os.environ.get("TSLM_NUM_WORKERS", "8"))
+    if nw <= 0:
+        return {"num_workers": 0}
+    return {
+        "num_workers": nw,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": 4,
+    }
+
+
 # Global stage configuration - users can modify this to mix and match stages.
 # 2026-06-13 (user): M4 captioning (stage2) DROPPED — HAR-CoT now transfers directly from TSQA
 # (stage1). Removing it from this list makes _load_previous_stage_model resolve stage3's previous
@@ -396,6 +416,7 @@ class CurriculumTrainer:
                 collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
                     batch, patch_size=patch_size
                 ),
+                **_loader_perf_kwargs(),
             )
         else:
             return DataLoader(
@@ -405,6 +426,7 @@ class CurriculumTrainer:
                 collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
                     batch, patch_size=patch_size
                 ),
+                **_loader_perf_kwargs(),
             )
 
     def _save_checkpoint(
@@ -1289,6 +1311,7 @@ class CurriculumTrainer:
                     collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
                         batch, patch_size=self.patch_size
                     ),
+                    **_loader_perf_kwargs(),
                 )
         else:
             train_loader = self._merge_data_loaders(
@@ -1602,7 +1625,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage2_captioning",
             dataset_class=M4QADataset,
-            num_epochs=10,  # transfer stages: shorter ceiling (user 2026-06-12); stage-1 stays 30
+            num_epochs=50,  # uniform 50-ep ceiling all stages (user 2026-06-13): lock 50 everywhere to preempt epoch-budget inconsistency reviews
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1627,7 +1650,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage3_cot",
             dataset_class=HARCoTQADataset,
-            num_epochs=30,  # CoT stages -> 30 (user 2026-06-13, switching to 30 for HAR/Sleep)
+            num_epochs=50,  # uniform 50-ep ceiling all stages (user 2026-06-13): lock 50 everywhere to preempt epoch-budget inconsistency reviews
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1653,7 +1676,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage4_sleep_cot",
             dataset_class=SleepEDFCoTQADataset,
-            num_epochs=30,  # CoT stages -> 30 (user 2026-06-13, switching to 30 for HAR/Sleep)
+            num_epochs=50,  # uniform 50-ep ceiling all stages (user 2026-06-13): lock 50 everywhere to preempt epoch-budget inconsistency reviews
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
@@ -1679,7 +1702,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage5_ecg_cot",
             dataset_class=ECGQACoTQADataset,
-            num_epochs=10,  # transfer stages: shorter ceiling (user 2026-06-12); stage-1 stays 30
+            num_epochs=50,  # uniform 50-ep ceiling all stages (user 2026-06-13): lock 50 everywhere to preempt epoch-budget inconsistency reviews
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
