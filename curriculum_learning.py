@@ -230,11 +230,16 @@ class CurriculumTrainer:
 
         # TSLM_COMPILE=1: torch.compile the LM backbone (~2.5x steady-state on the attention legs;
         # static shapes settle after a ~10-15min warmup since TSQA seq-lengths are bounded). Compile
-        # the inner .llm BEFORE the DDP wrap so the compiled region sits inside DDP. Skipped for
-        # MAMBA BACKBONES (the fused selective-scan kernel doesn't play well with compile) — note
-        # llama_bins is MambaTSLM with a Llama backbone, so it DOES compile.
+        # the inner .llm BEFORE the DDP wrap so the compiled region sits inside DDP. SKIPPED for:
+        #  - MAMBA BACKBONES: the fused selective-scan kernel doesn't play well with compile (note
+        #    llama_bins is MambaTSLM with a Llama backbone, so it DOES compile);
+        #  - FLAMINGO: measured 2026-06-13 to gain ~0% (0.159→0.159 s/it) — open_flamingo's gated
+        #    cross-attn graph-breaks so heavily that almost nothing compiles, while still paying the
+        #    warmup + eval-recompile risk. So compile only helps SP + llama_bins; this guard lets the
+        #    chain leave TSLM_COMPILE=1 on globally and have it no-op where it's worthless.
         _is_mamba_backbone = "mamba" in (self.llm_id or "").lower()
-        if os.environ.get("TSLM_COMPILE") == "1" and not _is_mamba_backbone:
+        _compile_worthless = _is_mamba_backbone or self.model_type == "OpenTSLMFlamingo"
+        if os.environ.get("TSLM_COMPILE") == "1" and not _compile_worthless:
             if self.rank == 0:
                 print("⚡ torch.compile on the LM backbone (TSLM_COMPILE=1)")
             model.llm = torch.compile(model.llm)
