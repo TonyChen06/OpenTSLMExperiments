@@ -619,6 +619,20 @@ class CurriculumTrainer:
             except Exception as e:
                 print(f"⚠️  Could not read loss history: {e}")
 
+    def _rotate_stale_loss_history(self, stage: str):
+        """No-resume hygiene: on a fresh (non-resume) training start, move aside a stale
+        loss_history.txt left by a prior run so the new run writes a clean history instead of
+        appending onto old epochs (the file is opened in append mode). best_model.pt is overwritten
+        from epoch 1 anyway (best_val_loss resets to inf), so only the append-mode history needs
+        rotating."""
+        p = os.path.join(self.results_dir, stage, "checkpoints", "loss_history.txt")
+        if os.path.exists(p):
+            try:
+                os.replace(p, p + ".prev")  # overwrite any older .prev
+                print(f"🧹 Rotated stale loss history → {os.path.basename(p)}.prev (no-resume policy)")
+            except OSError as e:
+                print(f"⚠️  Could not rotate stale loss history: {e}")
+
     def _load_checkpoint(
         self, stage: str, optimizer, scheduler, eval_only: bool = False
     ):
@@ -1378,23 +1392,36 @@ class CurriculumTrainer:
                 print(f"🔁 RESUME {stage_name} from latest.pt → epoch {start_epoch} "
                       f"(best_val {best_val_loss:.4f}, no_improve {epochs_no_improve}/{EARLY_STOP_PAT})")
                 self._display_loss_history(stage_name)
-        else:
-            # Load previous checkpoint if exists (for resuming current stage)
+        elif eval_only:
+            # EVAL: load this stage's trained best_model.pt to evaluate it.
             best_epoch, best_val_loss = self._load_checkpoint(
-                stage_name, optimizer, scheduler, eval_only=eval_only
+                stage_name, optimizer, scheduler, eval_only=True
             )
             if best_epoch is not None:
                 print(
-                    f"📂 Resuming {stage_name} from epoch {best_epoch} (val_loss: {best_val_loss:.4f})"
+                    f"📂 Loaded {stage_name} best_model.pt for eval (epoch {best_epoch}, val_loss: {best_val_loss:.4f})"
                 )
-                # Display previous loss history if available
                 self._display_loss_history(stage_name)
-            else:
-                print(f"🆕 Starting fresh training for {stage_name}")
-                best_val_loss = float("inf")  # Ensure proper initialization
-            best_raw_val_loss = best_val_loss  # raw-best tracker for checkpoint selection (decoupled from min_delta)
+            best_raw_val_loss = best_val_loss
             epochs_no_improve = 0
             start_epoch = (best_epoch + 1 if best_epoch is not None else 1)
+        else:
+            # ── NO-RESUME POLICY (2026-06-14) ──────────────────────────────────────────────────
+            # A fresh TRAINING run must NOT silently continue from this stage's own best_model.pt.
+            # The legacy path here used to call _load_checkpoint(stage_name) unconditionally, which
+            # loaded a stale FULLY-TRAINED checkpoint from a prior run (→ "Epoch 29/50", loss=0.0000
+            # from step 0) and would have burned the entire run on already-converged weights. We now
+            # start genuinely fresh: TSLM_RESUME (handled above) is the SOLE explicit
+            # continue-training path. We also rotate any stale loss_history.txt so the new run writes
+            # a clean history rather than appending onto the old epochs.
+            if self.rank == 0:
+                self._rotate_stale_loss_history(stage_name)
+            print(f"🆕 Starting fresh training for {stage_name}")
+            best_epoch = None
+            best_val_loss = float("inf")  # Ensure proper initialization
+            best_raw_val_loss = best_val_loss  # raw-best tracker for checkpoint selection (decoupled from min_delta)
+            epochs_no_improve = 0
+            start_epoch = 1
 
         # Skip training loop if eval_only is True
         if eval_only:
