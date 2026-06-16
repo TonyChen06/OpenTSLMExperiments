@@ -225,6 +225,14 @@ class CurriculumTrainer:
                 device=self.device,
                 lora_r=16,
             ).to(self.device)
+            # Wire --gradient_checkpointing through to the HF Mamba backbone (the curriculum only
+            # passed it to Flamingo before). HF Mamba supports it (verified 2026-06-16) and it cuts
+            # peak memory ~3x (40GB OOM -> 13GB at bs4) for the long-signal Sleep stage, letting us
+            # keep eff-16 instead of dropping the batch. Trades compute (recompute in backward) for memory.
+            if self.gradient_checkpointing:
+                model.llm.gradient_checkpointing_enable()
+                if self.rank == 0:
+                    print("🧮 gradient checkpointing enabled on Mamba backbone")
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
