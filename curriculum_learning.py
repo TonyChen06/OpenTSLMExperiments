@@ -2098,6 +2098,14 @@ def main():
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
 
+    # TSLM_SEED: deterministic init+dropout for controlled A/B (e.g. compile-on vs compile-off with
+    # everything else identical). Set on all ranks BEFORE model construction. Default off (no seed).
+    _seed = os.environ.get("TSLM_SEED")
+    if _seed is not None:
+        _s = int(_seed)
+        torch.manual_seed(_s); torch.cuda.manual_seed_all(_s); random.seed(_s)
+        print(f"🌱 TSLM_SEED={_s} (deterministic init)")
+
     # Initialize trainer
     trainer = CurriculumTrainer(
         args.model,
