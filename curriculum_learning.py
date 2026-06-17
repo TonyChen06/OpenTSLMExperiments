@@ -1036,7 +1036,12 @@ class CurriculumTrainer:
         # Set higher max_tokens for generation during evaluation. stage1 is multiple-choice —
         # the answer is "(x)" (~4 tokens) and the metric parses the FIRST letter, so a 2000-token
         # cap only lets half-trained models ramble for minutes per batch; 64 is already generous.
-        max_new_tokens = 64 if stage_name == "stage1_mcq" else 2000
+        # CoT stages: 256 (was 2000). Clean models (mamba/llama_bins) stop at EOS ~150 tokens so this
+        # is a no-op for them; but Flamingo's open_flamingo generate never stops at EOS (it watches
+        # <|endofchunk|>=128256, the model emits <|end_of_text|>=128001) and ran the full 2000 tokens
+        # => ~80s/sample, 46h HAR eval. Measured: the CoT "Answer:" lands within 171 tokens (max), so
+        # 256 captures every answer while bounding the runaway ~7x. (2026-06-17)
+        max_new_tokens = 64 if stage_name == "stage1_mcq" else 256
 
         # Prepare per-rank streaming writer for test predictions
         results_file_rank = os.path.join(
