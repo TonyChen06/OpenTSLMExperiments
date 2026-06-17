@@ -361,11 +361,18 @@ class OpenTSLMSP(TimeSeriesLLM):
                 emb_l[i, Lp - n:] = inputs_embeds[i, :n]
                 mask_l[i, Lp - n:] = attention_mask[i, :n]
             inputs_embeds, attention_mask = emb_l, mask_l
-        position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+        # ★ GENERATION FIX (2026-06-17): do NOT pass explicit position_ids to generate().
+        # The left-pad realignment above is sufficient — HF derives positions from the
+        # attention_mask internally during generation. Passing position_ids broke RoPE
+        # position advancement for the *generated* tokens: the error compounds with length,
+        # so short outputs (MCQ, ~1 token) were unaffected but long CoT (~200 tokens) collapsed
+        # into endless degenerate text that never reached "Answer:" (F1≈0). Verified bs=1 and
+        # bs>1: with position_ids the model loops to max_new_tokens; without, it emits clean,
+        # terminating CoT. (compute_loss's forward DOES still need position_ids for the left-pad
+        # batch-invariance fix — only generation must omit them, since generate() advances its own.)
         gen_ids = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            position_ids=position_ids,
             max_new_tokens=max_new_tokens,
             **generate_kwargs,
         )
