@@ -455,20 +455,25 @@ class OpenTSLMSP(TimeSeriesLLM):
 
             # Load LoRA adapters
             try:
-                lora_state = checkpoint["lora_state"]
+                # ── _orig_mod NORMALIZATION (bug fix 2026-06-17) ─────────────────────────────────
+                # torch.compile wraps the module so its state_dict keys gain an "_orig_mod." prefix.
+                # A checkpoint saved while COMPILED (e.g. TSLM_COMPILE=1 training) therefore has keys
+                # like "base_model.model._orig_mod.model.layers...lora_A...". When reloaded UNCOMPILED
+                # (eval / stage transfer), the model's param names lack that prefix, so `name in
+                # lora_state` never matched and `allow_missing=True` SILENTLY DROPPED THE ENTIRE LoRA
+                # ADAPTER → eval ran on the unadapted base LM (garbage). Strip "_orig_mod." on both
+                # sides so the adapter loads regardless of compiled/uncompiled at save vs load time.
+                def _norm(k):
+                    return k.replace("_orig_mod.", "")
+
+                lora_state = {_norm(k): v for k, v in checkpoint["lora_state"].items()}
                 loaded_count = 0
                 missing_keys = []
 
-                # Track which LoRA parameters we expect to find
-                expected_lora_params = {
-                    name
-                    for name, param in self.llm.named_parameters()
-                    if param.requires_grad and "lora_" in name
-                }
-
                 for name, param in self.llm.named_parameters():
-                    if name in lora_state and param.requires_grad and "lora_" in name:
-                        param.data.copy_(lora_state[name])
+                    nname = _norm(name)
+                    if nname in lora_state and param.requires_grad and "lora_" in name:
+                        param.data.copy_(lora_state[nname])
                         loaded_count += 1
                     elif param.requires_grad and "lora_" in name:
                         missing_keys.append(name)

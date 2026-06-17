@@ -86,6 +86,15 @@ def _loader_perf_kwargs():
     }
 
 
+def _strip_orig_mod(state: dict) -> dict:
+    """torch.compile wraps a module so its state_dict keys gain an '_orig_mod.' prefix. A checkpoint
+    saved while COMPILED (TSLM_COMPILE=1) but reloaded UNCOMPILED (eval / stage transfer) won't match,
+    and strict=False / allow_missing then SILENTLY DROPS the trainable adapter -> eval on the unadapted
+    base model (garbage). Strip the prefix so trainable state loads regardless of compiled-ness. (BUG
+    FIX 2026-06-17; affects all compiled legs: SP, llama_bins. mamba/Flamingo aren't compiled.)"""
+    return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
+
 # Global stage configuration - users can modify this to mix and match stages.
 # 2026-06-13 (user): M4 captioning (stage2) DROPPED — HAR-CoT now transfers directly from TSQA
 # (stage1). Removing it from this list makes _load_previous_stage_model resolve stage3's previous
@@ -669,7 +678,7 @@ class CurriculumTrainer:
                 # Trainable-only checkpoint (LoRA + bin-embeddings); the frozen backbone is already
                 # loaded from the hub at init -> strict=False tolerates the unsaved frozen keys.
                 missing_keys, unexpected_keys = model.load_state_dict(
-                    checkpoint["model_state"], strict=False
+                    _strip_orig_mod(checkpoint["model_state"]), strict=False
                 )
                 if unexpected_keys and self.rank == 0:
                     print(
@@ -924,7 +933,7 @@ class CurriculumTrainer:
                 # Carry forward the trainable LoRA + bin-embeddings from the previous stage;
                 # strict=False tolerates the unsaved frozen backbone (loaded from the hub at init).
                 missing_keys, unexpected_keys = model.load_state_dict(
-                    checkpoint["model_state"], strict=False
+                    _strip_orig_mod(checkpoint["model_state"]), strict=False
                 )
                 if unexpected_keys and self.rank == 0:
                     print(
@@ -2068,6 +2077,14 @@ def main():
     # Set up global logging
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
+
+    # TSLM_SEED: deterministic init+dropout for controlled A/B (e.g. compile-on vs compile-off with
+    # everything else identical). Set on all ranks BEFORE model construction. Default off (no seed).
+    _seed = os.environ.get("TSLM_SEED")
+    if _seed is not None:
+        _s = int(_seed)
+        torch.manual_seed(_s); torch.cuda.manual_seed_all(_s); random.seed(_s)
+        print(f"🌱 TSLM_SEED={_s} (deterministic init)")
 
     # Initialize trainer
     trainer = CurriculumTrainer(
