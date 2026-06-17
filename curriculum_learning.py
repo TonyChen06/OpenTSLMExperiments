@@ -86,15 +86,6 @@ def _loader_perf_kwargs():
     }
 
 
-def _strip_orig_mod(state: dict) -> dict:
-    """torch.compile wraps a module so its state_dict keys gain an '_orig_mod.' prefix. A checkpoint
-    saved while COMPILED (TSLM_COMPILE=1) but reloaded UNCOMPILED (eval / stage transfer) won't match,
-    and strict=False / allow_missing then SILENTLY DROPS the trainable adapter -> eval on the unadapted
-    base model (garbage). Strip the prefix so trainable state loads regardless of compiled-ness. (BUG
-    FIX 2026-06-17; affects all compiled legs: SP, llama_bins. mamba/Flamingo aren't compiled.)"""
-    return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-
-
 # Global stage configuration - users can modify this to mix and match stages.
 # 2026-06-13 (user): M4 captioning (stage2) DROPPED — HAR-CoT now transfers directly from TSQA
 # (stage1). Removing it from this list makes _load_previous_stage_model resolve stage3's previous
@@ -677,9 +668,22 @@ class CurriculumTrainer:
             elif self.model_type == "MambaTSLM":
                 # Trainable-only checkpoint (LoRA + bin-embeddings); the frozen backbone is already
                 # loaded from the hub at init -> strict=False tolerates the unsaved frozen keys.
-                missing_keys, unexpected_keys = model.load_state_dict(
-                    _strip_orig_mod(checkpoint["model_state"]), strict=False
-                )
+                # Normalize torch.compile's '._orig_mod.' prefix on BOTH sides so the checkpoint
+                # loads regardless of whether IT or the live MODEL is compiled/eager: key the aligned
+                # dict by the MODEL's actual param names, matched to checkpoint values on the
+                # prefix-stripped name. Else strict=False silently drops EVERY trainable LoRA+embed
+                # key when the two sides' compile state differs. Bug confirmed 2026-06-14.
+                _strip = lambda k: k.replace("._orig_mod.", ".")
+                _ckpt = {_strip(k): v for k, v in checkpoint["model_state"].items()}
+                _aligned = {name: _ckpt[_strip(name)]
+                            for name in model.state_dict().keys() if _strip(name) in _ckpt}
+                missing_keys, unexpected_keys = model.load_state_dict(_aligned, strict=False)
+                # Loud warning if any TRAINABLE key failed to load (frozen-backbone misses are normal).
+                # NB: lm_head excluded — it's tied to embed_tokens (tie_word_embeddings=True), so the
+                # ckpt saves only embed_tokens and the tied head follows it (benign 'missing').
+                _bad = [k for k in missing_keys if any(t in k for t in ("lora", "bin", "embed_tokens"))]
+                if _bad and self.rank == 0:
+                    print(f"🚨 {len(_bad)} TRAINABLE keys MISSING when loading MambaTSLM ckpt for {stage} (e.g. {_bad[:3]}) — checkpoint/model mismatch!")
                 if unexpected_keys and self.rank == 0:
                     print(
                         f"⚠️  Warning: Unexpected keys when loading MambaTSLM checkpoint for {stage}:"
@@ -932,9 +936,20 @@ class CurriculumTrainer:
             elif self.model_type == "MambaTSLM":
                 # Carry forward the trainable LoRA + bin-embeddings from the previous stage;
                 # strict=False tolerates the unsaved frozen backbone (loaded from the hub at init).
-                missing_keys, unexpected_keys = model.load_state_dict(
-                    _strip_orig_mod(checkpoint["model_state"]), strict=False
-                )
+                # Normalize torch.compile's '._orig_mod.' prefix on BOTH sides so a stage-1 ckpt
+                # saved while COMPILED transfers into an eager (or differently-compiled) stage-3
+                # model — else strict=False silently drops EVERY trainable key and HAR trains from
+                # base. (Same fix as the eval-load path; bug confirmed 2026-06-14.)
+                _strip = lambda k: k.replace("._orig_mod.", ".")
+                _ckpt = {_strip(k): v for k, v in checkpoint["model_state"].items()}
+                _aligned = {name: _ckpt[_strip(name)]
+                            for name in model.state_dict().keys() if _strip(name) in _ckpt}
+                missing_keys, unexpected_keys = model.load_state_dict(_aligned, strict=False)
+                # NB: lm_head excluded — it's tied to embed_tokens (tie_word_embeddings=True), so the
+                # ckpt saves only embed_tokens and the tied head follows it (benign 'missing').
+                _bad = [k for k in missing_keys if any(t in k for t in ("lora", "bin", "embed_tokens"))]
+                if _bad and self.rank == 0:
+                    print(f"🚨 {len(_bad)} TRAINABLE keys MISSING transferring {previous_stage}→ (e.g. {_bad[:3]}) — stage carry-forward FAILED!")
                 if unexpected_keys and self.rank == 0:
                     print(
                         f"⚠️  Warning: Unexpected keys loading previous stage {previous_stage} (MambaTSLM):"
