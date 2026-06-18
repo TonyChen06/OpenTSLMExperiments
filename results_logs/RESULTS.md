@@ -28,3 +28,30 @@ Getting here took TWO bug fixes on the SP eval path:
 mamba-1.4b > SP on both CoT tasks (HAR 0.671 vs 0.650, Sleep 0.627 vs 0.584); ~tie on TSQA acc.
 Box B: append Flamingo / llama_bins / mamba-370m rows + `results_logs/boxB_*.txt`; re-eval llama_bins
 (compiled → same _orig_mod bug). Compute all F1s with `tslm_study/codebase_f1.py` for parity.
+
+---
+# Box B results (llama_bins, mamba-370m, Flamingo) — codebase_f1, macro-F1
+
+All scored with `tslm_study/codebase_f1.py <task> <preds.jsonl>` (same paper parsers as Box A).
+Flamingo's CoT (HAR/Sleep) has an EOS bug: open_flamingo's generate watches <|endofchunk|>=128256
+but the model emits <|end_of_text|>=128001, so it never stops — capped at 256 tok (the answer lands
+≤172 tok). The post-answer ramble (often glued to the label) breaks the parser's `split("Answer: ")[-1]`,
+so Flamingo CoT preds are cleaned by matching the answer to the known label vocabulary before scoring
+(equivalent to a working EOS stop; the model's stated answer is unchanged). mamba/llama_bins stop at
+EOS cleanly and are scored directly.
+
+| model | task | best-ep | acc | F1 |
+|---|---|---|---|---|
+| mamba-370m | TSQA | 26 | 0.9967 | 0.9967 |
+| mamba-370m | HAR | 21 | 0.7018 | 0.6626 |
+| mamba-370m | Sleep | ~ | 0.7479 | 0.6075 |
+| llama_bins | TSQA | 23 | 0.9419 | 0.9425 |
+| llama_bins | HAR | 34 | 0.6773 | 0.6239 |
+| llama_bins | Sleep | ~ | 0.6620 | 0.4863 |
+| Flamingo | TSQA | 41 | 0.9190 | 0.9198 |
+| Flamingo | HAR | 34 | 0.6733 | 0.5701 |
+| Flamingo | Sleep | ~ | 0.6942 | 0.4335 |
+
+CONSOLIDATED (both boxes): SSM (Mamba) tops every task. mamba-1.4b #1 on TSQA/HAR/Sleep
+(0.998/0.671/0.627); even mamba-370m (0.997/0.663/0.608) beats all 3 attention baselines on all 3
+tasks. Attention ordering: SP (enc) > llama_bins (tok) > Flamingo (enc) on the CoT tasks.
